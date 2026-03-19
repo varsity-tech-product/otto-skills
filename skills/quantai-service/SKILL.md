@@ -25,7 +25,8 @@ BASE_URL = http://47.129.240.216:8000
 2. **禁止下载或存储 parquet 数据文件**，不要尝试访问服务器上的数据文件。
 3. **禁止修改 `/home/ec2-user/quant-factor-loop/` 下的任何文件**，该目录只属于服务器内部。
 4. **轮询时禁止无限等待**：单个 Job 最长等待 30 分钟，超时后告知用户并停止。
-5. **禁止跳过 retest 步骤**：C# 编译失败时必须修复 strategy.cs 后 retest，不能直接宣告失败。
+5. **禁止跳过 retest 步骤**：Step 4C 的 C# 编译失败时必须修复 strategy.cs 后 retest，不能直接宣告失败。
+6. **禁止等待 Step 5 及之后的步骤**：Step 4C 完成后立即获取结果，不再轮询。Step 5-16 是服务端内部调优，与用户无关。
 
 ---
 
@@ -40,10 +41,10 @@ BASE_URL = http://47.129.240.216:8000
     └── {job_id}/
         ├── plugin.py               ← 提交时上传的因子插件（阶段2完成后保存）
         ├── strategy.cs             ← Step 4a 生成的 C# 策略（strategy_cs_ready=true 后下载）
-        ├── factor_card_default.json← Step 16D 默认参数因子档案卡（用户版，任务 done 后下载）
+        ├── factor_card_default.json← Step 4C 默认参数因子档案卡（Step 4C 完成后下载）
         └── step4c/
-            ├── equity_curves.png   ← Step 4C 默认参数权益曲线图（用户版，任务 done 后下载）
-            └── trade_log.csv       ← Step 4C 默认参数交易记录（用户版，任务 done 后下载）
+            ├── equity_curves.png   ← Step 4C 默认参数权益曲线图（Step 4C 完成后下载）
+            └── trade_log.csv       ← Step 4C 默认参数交易记录（Step 4C 完成后下载）
 ```
 
 > **说明**：服务器内部会跑两次云端回测——Step 4C（默认参数）和 Step 11（调优参数）。
@@ -62,12 +63,12 @@ Step 4B    计算原始信号（Python 研究镜像）
 Step 4C    默认参数云端 Lean 回测 ← 用户看到的结果来自这里
 Step 5-10  Z-score / EWMA / 网格搜索（服务端内部分析）
 Step 11    调优参数云端 Lean 回测（服务端内部分析）
-Step 12-16 因子画像、汇总、敏感性、分组、因子档案卡（服务端内部）
-Step 16D   生成默认参数因子档案卡 ← 用户看到的卡片来自这里
+Step 12-16 因子画像、汇总、敏感性、分组、因子档案卡（服务端内部，Agent 无需关心）
+Step 16D   生成默认参数因子档案卡（服务端内部，Agent 无需关心）
 ```
 
-> Agent 唯一需要介入的场景：C# 编译失败（`failed_step="4c"` 或 `11`）→ 修复 strategy.cs → retest。
-> 其余步骤全部自动串联执行。
+> Agent 唯一需要介入的场景：C# 编译失败（`failed_step="4c"`）→ 修复 strategy.cs → retest。
+> Step 4C 回测完成后，Agent 即可获取结果并展示给用户，**无需等待 Step 5 及之后的步骤**。
 
 ---
 
@@ -191,7 +192,7 @@ def build_signal(
     return signal.reindex_like(close)
 ```
 
-#### C# 代码约束（违反会导致 Step 11 编译失败）
+#### C# 代码约束（违反会导致 Step 4C 编译失败）
 
 | 约束 | 说明 |
 |------|------|
@@ -462,12 +463,14 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/status
 
 | status | Agent 行为 |
 |--------|-----------|
-| `queued` / `running` | 继续等待。每 2~3 次轮询告知用户当前进度 |
-| `done` | 进入**阶段 4**获取结果 |
-| `failed`（`failed_step="4c"` 或 `11`） | 进入**阶段 3b**修复 C# |
+| `queued` / `running`（`current_step` < `"5"`） | 继续等待。每 2~3 次轮询告知用户当前进度 |
+| `running`（`current_step` >= `"5"`）或 `done` | **Step 4C 已完成**，立即进入**阶段 4**获取结果，不再轮询 |
+| `failed`（`failed_step="4c"`） | 进入**阶段 3b**修复 C# |
 | `failed`（其他 step） | 告知用户服务器内部错误，无法修复 |
 | `retesting` | 继续等待 |
 | `retest_failed` | 查看 retest 日志，再次修复 strategy.cs |
+
+> **关键规则**：一旦轮询发现 `current_step` 已进入 Step 5 或更后面的步骤，说明 Step 4C（默认参数回测）已完成，Agent 应立即停止轮询并进入阶段 4 获取结果。Step 5-16 是服务端内部调优分析，与用户无关。
 
 #### strategy_cs_ready 标志
 
@@ -484,7 +487,7 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs \
 
 ### 阶段 3b：修复 C# 编译错误并 retest
 
-当 `status=failed` 且 `failed_step` 为 `"4c"` 或 `11` 时执行。
+当 `status=failed` 且 `failed_step` 为 `"4c"` 时执行。
 
 **1. 查看错误日志**
 
@@ -527,24 +530,11 @@ curl -s -X POST ${BASE_URL}/jobs/${JOB_ID}/retest \
 
 ### 阶段 4：获取结果、展示给用户、开始下一个因子
 
-#### 4a. 获取结果
+> **⚠️ 关键规则**：`current_step >= 5` 时 Step 4C 已完成，**直接下载文件**。
+> **禁止调用 `/result` 接口**——该接口需要整个 pipeline（Step 16D）跑完才返回数据，
+> 而用户只需要看 Step 4C 的默认参数回测结果，不需要等后续步骤。
 
-```bash
-JOB_ID=$(cat ~/.quant_agent/current_job_id.txt)
-curl -s ${BASE_URL}/jobs/${JOB_ID}/result
-```
-
-**只关注 `default_` 前缀字段**（默认参数版 = 用户可见版）：
-
-| 字段 | 用途 |
-|------|------|
-| `default_factor_card_txt` | **直接展示给用户的因子档案卡** |
-| `default_factor_status` | `"pass"` 或 `"fail"` |
-| `default_val_summary.median_sharpe` | 默认参数中位 Sharpe |
-
-> 不要展示 `factor_card_txt`、`best_params`、`factor_status`——那些是调优参数版，仅服务端留存。
-
-#### 4b. 下载产物文件
+#### 4a. 下载产物文件（Step 4C 完成即可下载）
 
 ```bash
 JOB_ID=$(cat ~/.quant_agent/current_job_id.txt)
@@ -561,10 +551,25 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
   -o ${JOB_DIR}/step4c/trade_log.csv
 ```
 
+#### 4b. 从 factor_card_default.json 读取结果并展示
+
+下载完成后，直接读取本地的 `factor_card_default.json` 文件，从中提取关键指标：
+
+| JSON 字段 | 用途 |
+|-----------|------|
+| `status` | `"pass"` 或 `"fail"` |
+| `median_sharpe` | 默认参数中位 Sharpe |
+| `icir` | IC 信息比率 |
+| `median_annual_return` | 中位年化收益 |
+| `median_max_drawdown` | 中位最大回撤 |
+| `win_rate` | 胜率 |
+
+同时打开 `equity_curves.png` 展示权益曲线图。
+
 #### 4c. 展示结果并进入下一轮
 
-将 `default_factor_card_txt` 完整展示给用户，用一段话总结核心表现：
-- 重点突出 `default_factor_status`（pass/fail）、`median_sharpe`、`icir`
+用一段话总结核心表现：
+- 重点突出 `status`（pass/fail）、`median_sharpe`、`icir`
 - 如果 fail，分析原因并建议改进方向
 
 **展示完结果后，直接与用户讨论下一个因子**——不需要等服务器做其他事情，这个因子的全部工作已经结束。
@@ -586,12 +591,12 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
 [阶段2] POST /jobs/submit → 拿到 job_id，归档 plugin.py
         │
         ▼
-[阶段3] 轮询等 done（服务器后台自动跑完全部步骤）
+[阶段3] 轮询等待 Step 4C 完成（current_step >= 5 或 done）
         │
         ├─ strategy_cs_ready=true → 下载 strategy.cs
-        ├─ failed (4c/11) → [阶段3b] 修 C# → retest → 回到轮询
+        ├─ failed (4c) → [阶段3b] 修 C# → retest → 回到轮询
         │
-        └─ done
+        └─ current_step >= 5 或 done
              │
              ▼
 [阶段4] 下载 default_ 文件 → 展示因子卡片 → 讨论下一个因子
@@ -616,6 +621,7 @@ curl -s ${BASE_URL}/health
 - 提交任务后立即告知 job_id
 - 每 2~3 次轮询告知用户当前进度（不必每次都说）
 - 看到 `current_step="4c"` 时说「正在云端回测，约需 3~5 分钟」
-- 遇到 C# 编译失败时告知用户「正在修复代码后重试」，不要抛出错误
+- 遇到 C# 编译失败（仅 Step 4C）时告知用户「正在修复代码后重试」，不要抛出错误
+- **一旦 `current_step` >= 5，立即停止轮询，获取结果**
 - 结果出来后重点突出 pass/fail、median_sharpe、icir
 - **只展示默认参数版卡片**，展示完直接进入下一个因子
