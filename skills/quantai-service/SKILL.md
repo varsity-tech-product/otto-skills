@@ -25,7 +25,7 @@ BASE_URL = http://47.129.240.216:8000
 2. **禁止下载或存储 parquet 数据文件**，不要尝试访问服务器上的数据文件。
 3. **禁止修改 `/home/ec2-user/quant-factor-loop/` 下的任何文件**，该目录只属于服务器内部。
 4. **轮询时禁止无限等待**：单个 Job 最长等待 30 分钟，超时后告知用户并停止。
-5. **禁止跳过 retest 步骤**：Step 11 失败时必须修复 strategy.cs 后 retest，不能直接宣告失败。
+5. **禁止跳过 retest 步骤**：C# 编译失败时必须修复 strategy.cs 后 retest，不能直接宣告失败。
 
 ---
 
@@ -40,15 +40,38 @@ BASE_URL = http://47.129.240.216:8000
     └── {job_id}/
         ├── plugin.py               ← 提交时上传的因子插件（阶段2完成后保存）
         ├── strategy.cs             ← Step 4a 生成的 C# 策略（strategy_cs_ready=true 后下载）
-        ├── factor_card.json        ← Step 16 因子档案卡（任务 done 后下载）
-        └── step11/
-            ├── equity_curves.png   ← Step 11 权益曲线图（任务 done 后下载）
-            └── trade_log.csv       ← Step 11 逐笔交易记录（任务 done 后下载）
+        ├── factor_card_default.json← Step 16D 默认参数因子档案卡（用户版，任务 done 后下载）
+        └── step4c/
+            ├── equity_curves.png   ← Step 4C 默认参数权益曲线图（用户版，任务 done 后下载）
+            └── trade_log.csv       ← Step 4C 默认参数交易记录（用户版，任务 done 后下载）
 ```
+
+> **说明**：服务器内部会跑两次云端回测——Step 4C（默认参数）和 Step 11（调优参数）。
+> Agent 只下载并展示给用户**默认参数版**（`default_` 前缀文件），调优参数版留在服务端。
 
 ---
 
-## 完整工作流程（必须按顺序执行）
+## 服务器内部流程（Agent 无需操作，仅供了解）
+
+提交任务后，服务器自动执行以下步骤，**Agent 全程只需轮询等待**：
+
+```
+Step 1-3   加载配置、计算前向收益、设置退出规则
+Step 4A    生成 C# 策略代码（strategy.cs）
+Step 4B    计算原始信号（Python 研究镜像）
+Step 4C    默认参数云端 Lean 回测 ← 用户看到的结果来自这里
+Step 5-10  Z-score / EWMA / 网格搜索（服务端内部分析）
+Step 11    调优参数云端 Lean 回测（服务端内部分析）
+Step 12-16 因子画像、汇总、敏感性、分组、因子档案卡（服务端内部）
+Step 16D   生成默认参数因子档案卡 ← 用户看到的卡片来自这里
+```
+
+> Agent 唯一需要介入的场景：C# 编译失败（`failed_step="4c"` 或 `11`）→ 修复 strategy.cs → retest。
+> 其余步骤全部自动串联执行。
+
+---
+
+## Agent 工作流程（必须按顺序执行）
 
 ### 阶段 0：确认任务
 
@@ -426,39 +449,29 @@ cp /tmp/current_plugin.py ~/.quant_agent/jobs/${JOB_ID}/plugin.py
 
 ---
 
-### 阶段 3：轮询进度
+### 阶段 3：轮询等待
 
-每 **15 秒**查询一次，最多等待 **30 分钟**：
+每 **15 秒**查询一次，最多等待 **30 分钟**。服务器内部步骤全自动执行，Agent 只需等。
 
 ```bash
 JOB_ID=$(cat ~/.quant_agent/current_job_id.txt)
 curl -s ${BASE_URL}/jobs/${JOB_ID}/status
 ```
 
-返回示例：
+#### Agent 行为速查
 
-```json
-{
-  "status": "running",
-  "current_step": 10,
-  "progress": "IS 超参网格搜索"
-}
-```
-
-#### status 状态说明
-
-| status | 含义 | Agent 行为 |
-|--------|------|-----------|
-| `queued` | 排队中 | 继续等待 |
-| `running` | 执行中 | 告知用户当前步骤，继续等待 |
-| `done` | 全部完成 | 进入阶段 5 获取结果 |
-| `failed` | 工作流失败 | 读取 `error` 字段，判断是否可修复（进入阶段 4） |
-| `retesting` | 正在 retest | 继续轮询 |
-| `retest_failed` | retest 也失败 | 查看 retest 日志，再次修复 strategy.cs |
+| status | Agent 行为 |
+|--------|-----------|
+| `queued` / `running` | 继续等待。每 2~3 次轮询告知用户当前进度 |
+| `done` | 进入**阶段 4**获取结果 |
+| `failed`（`failed_step="4c"` 或 `11`） | 进入**阶段 3b**修复 C# |
+| `failed`（其他 step） | 告知用户服务器内部错误，无法修复 |
+| `retesting` | 继续等待 |
+| `retest_failed` | 查看 retest 日志，再次修复 strategy.cs |
 
 #### strategy_cs_ready 标志
 
-轮询时若返回 `"strategy_cs_ready": true`，立即下载并归档 strategy.cs：
+轮询时若返回 `"strategy_cs_ready": true`，立即下载并归档 strategy.cs（只需一次）：
 
 ```bash
 JOB_ID=$(cat ~/.quant_agent/current_job_id.txt)
@@ -466,113 +479,95 @@ mkdir -p ~/.quant_agent/jobs/${JOB_ID}
 curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs \
   -o ~/.quant_agent/jobs/${JOB_ID}/strategy.cs
 ```
-
-此操作只需执行一次（下载后不必重复）。
 
 ---
 
-### 阶段 4：处理 Step 11 失败（C# 编译 / 运行时错误）
+### 阶段 3b：修复 C# 编译错误并 retest
 
-当 `status=failed` 且 `failed_step=11` 时执行此阶段。
+当 `status=failed` 且 `failed_step` 为 `"4c"` 或 `11` 时执行。
 
-#### Step 4-1：查看错误日志
+**1. 查看错误日志**
 
 ```bash
-JOB_ID=$(cat ~/.quant_agent/current_job_id.txt)
 curl -s "${BASE_URL}/jobs/${JOB_ID}/logs?tail=80"
 ```
 
-#### Step 4-2：下载当前 strategy.cs
+**2. 下载并修复 strategy.cs**
 
 ```bash
-mkdir -p ~/.quant_agent/jobs/${JOB_ID}
 curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs \
   -o ~/.quant_agent/jobs/${JOB_ID}/strategy.cs
 ```
 
-#### Step 4-3：分析错误并修复
-
-根据日志中的错误信息修改 `~/.quant_agent/jobs/${JOB_ID}/strategy.cs`。
-
-常见错误速查表：
+根据日志中的错误信息修改。常见错误速查表：
 
 | 错误信息 | 原因 | 修复方式 |
 |---------|------|---------|
-| `CS0019: Operator '/' cannot be applied to 'double' and 'decimal'` | C# 类型不匹配 | 在除法前加 `(double)` 强转，或检查变量声明类型 |
+| `CS0019: Operator '/' cannot be applied to 'double' and 'decimal'` | C# 类型不匹配 | 在除法前加 `(double)` 强转 |
 | `CS0103: The name 'xxx' does not exist` | 变量名拼写错误或作用域不对 | 检查 `__FACTOR_PARAM_FIELDS__` 中的声明 |
-| `CS1002: ; expected` | C# 语法错误（缺分号等） | 检查 `__FACTOR_COMPUTE_BODY__` 的每行结尾 |
-| `CS0012: Type 'DynamicObject' not referenced` | 调用了 `GetLastData()` | 删除 `Securities[].GetLastData()` 调用，改用传入的 `prices[]` |
+| `CS0128: A local variable named 'xxx' is already defined` | 变量名与模板框架冲突 | 在 `__FACTOR_COMPUTE_BODY__` 中重命名变量（**不要动框架代码**） |
+| `CS1002: ; expected` | C# 语法错误 | 检查 `__FACTOR_COMPUTE_BODY__` 的每行结尾 |
 | `rawSignal` 始终为 0 | `return true` 前忘记给 `rawSignal` 赋值 | 确保所有代码路径都给 `rawSignal` 赋值 |
-| `return false` 导致无信号 | `__PRICE_WINDOW_EXPR__` 比实际需要大 | 调小 `__PRICE_WINDOW_EXPR__` 的值 |
 | Lean 运行时 NullReference | 访问了未初始化的字段 | 检查 `__FACTOR_INIT__` 是否遗漏了某个字段初始化 |
 
-**修复原则**：
-- 只修改 `__FACTOR_COMPUTE_BODY__` 对应的 C# 代码块区域
-- 如果是字段声明或初始化问题，找到 strategy.cs 中对应的 `#region` 块修改
-- 修改后在脑内或注释中验证每条代码路径都能给 `rawSignal` 赋值
+**修复原则**：只修改 `#region FactorComputeBody` 区域内的代码，不要动框架代码。
 
-#### Step 4-4：提交 retest
+**3. 提交 retest**
 
 ```bash
 curl -s -X POST ${BASE_URL}/jobs/${JOB_ID}/retest \
   -F "strategy_cs=@~/.quant_agent/jobs/${JOB_ID}/strategy.cs"
 ```
 
-返回 `{ "status": "retesting" }` 后回到**阶段 3**继续轮询。
+返回 `{ "status": "retesting" }` 后回到**阶段 3**继续轮询。retest 提交后，服务器自动从失败点恢复并跑完所有后续步骤。
 
-> retest 可以多次，每次服务器都会保留独立日志（`retest_001.log`、`retest_002.log`…）。
-> 若连续 3 次 retest 仍失败，重新审视 plugin.py 的 `FACTOR_SECTIONS` 是否有根本性错误，
-> 考虑重写 plugin.py 后重新 POST `/jobs/submit` 开新任务。
+> 若连续 3 次 retest 仍失败，考虑重写 plugin.py 后重新 POST `/jobs/submit` 开新任务。
 
 ---
 
-### 阶段 5：获取结果并下载文件
+### 阶段 4：获取结果、展示给用户、开始下一个因子
 
-#### Step 5-1：获取 JSON 结果
+#### 4a. 获取结果
 
 ```bash
 JOB_ID=$(cat ~/.quant_agent/current_job_id.txt)
 curl -s ${BASE_URL}/jobs/${JOB_ID}/result
 ```
 
-返回字段说明：
+**只关注 `default_` 前缀字段**（默认参数版 = 用户可见版）：
 
-| 字段 | 含义 | 关注点 |
-|------|------|--------|
-| `factor_status` | `"pass"` 或 `"fail"` | 最终结论 |
-| `best_params` | 超参搜索最优参数 | zscore_window / use_ewma / ewma_span / sigmoid_c |
-| `profile.ic_mean` | IC 均值 | > 0.03 是及格线 |
-| `profile.icir` | IC 信息比 | > 0.5 较好 |
-| `val_summary.median_sharpe` | VAL 段中位 Sharpe | > 1.0 是及格线 |
-| `val_summary.win_rate` | 胜率 | > 0.55 较好 |
-| `factor_card_txt` | 可读的因子档案卡全文 | 直接展示给用户 |
+| 字段 | 用途 |
+|------|------|
+| `default_factor_card_txt` | **直接展示给用户的因子档案卡** |
+| `default_factor_status` | `"pass"` 或 `"fail"` |
+| `default_val_summary.median_sharpe` | 默认参数中位 Sharpe |
 
-将 `factor_card_txt` 完整展示给用户，并用一段话总结因子的核心表现。
+> 不要展示 `factor_card_txt`、`best_params`、`factor_status`——那些是调优参数版，仅服务端留存。
 
-#### Step 5-2：下载任务产物文件
-
-任务 done 后，下载并归档以下文件到 job 目录：
+#### 4b. 下载产物文件
 
 ```bash
 JOB_ID=$(cat ~/.quant_agent/current_job_id.txt)
 JOB_DIR=~/.quant_agent/jobs/${JOB_ID}
-mkdir -p ${JOB_DIR}/step11
+mkdir -p ${JOB_DIR}/step4c
 
-# 因子档案卡
-curl -s ${BASE_URL}/jobs/${JOB_ID}/files/factor_card.json \
-  -o ${JOB_DIR}/factor_card.json
+curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_factor_card.json \
+  -o ${JOB_DIR}/factor_card_default.json
 
-# 权益曲线图
-curl -s ${BASE_URL}/jobs/${JOB_ID}/files/equity_curves.png \
-  -o ${JOB_DIR}/step11/equity_curves.png
+curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_equity_curves.png \
+  -o ${JOB_DIR}/step4c/equity_curves.png
 
-# 逐笔交易记录（完整下载）
-curl -s ${BASE_URL}/jobs/${JOB_ID}/files/trade_log.csv \
-  -o ${JOB_DIR}/step11/trade_log.csv
+curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
+  -o ${JOB_DIR}/step4c/trade_log.csv
 ```
 
-> strategy.cs 若在阶段3已下载，此处无需重复。若尚未下载，同样在此补下：
-> `curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs -o ${JOB_DIR}/strategy.cs`
+#### 4c. 展示结果并进入下一轮
+
+将 `default_factor_card_txt` 完整展示给用户，用一段话总结核心表现：
+- 重点突出 `default_factor_status`（pass/fail）、`median_sharpe`、`icir`
+- 如果 fail，分析原因并建议改进方向
+
+**展示完结果后，直接与用户讨论下一个因子**——不需要等服务器做其他事情，这个因子的全部工作已经结束。
 
 ---
 
@@ -582,66 +577,45 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/trade_log.csv \
 用户：「研究一个布林带宽度突破因子」
         │
         ▼
-[阶段0] 确认 factor_type=boll_breakout, params={window:20}
+[阶段0] 确认 factor_type / factor_name / params
         │
         ▼
-[阶段1] 写 /tmp/current_plugin.py
-        │  包含 FACTOR_SECTIONS（C#片段）+ build_signal()（Python）
+[阶段1] 写 plugin.py（C# 片段 + Python build_signal）
         │
         ▼
-[阶段2] POST /jobs/submit -F plugin=@/tmp/current_plugin.py
-        │  → 拿到 job_id，保存到 current_job_id.txt
-        │  → 归档 plugin.py 到 ~/.quant_agent/jobs/{job_id}/plugin.py
+[阶段2] POST /jobs/submit → 拿到 job_id，归档 plugin.py
         │
         ▼
-[阶段3] 每15秒 GET /jobs/{id}/status 轮询
+[阶段3] 轮询等 done（服务器后台自动跑完全部步骤）
         │
-        ├─ strategy_cs_ready=true
-        │       └─ GET /files/strategy.cs → 保存到 jobs/{job_id}/strategy.cs
+        ├─ strategy_cs_ready=true → 下载 strategy.cs
+        ├─ failed (4c/11) → [阶段3b] 修 C# → retest → 回到轮询
         │
-        ├─ status=running ──→ 告知用户当前 Step，继续等待
-        │
-        ├─ status=failed, failed_step=11
-        │       │
-        │       ▼
-        │  [阶段4] GET logs → GET /files/strategy.cs → 修复 → POST retest
-        │       │
-        │       └─ 回到阶段3继续轮询
-        │
-        └─ status=done
-                │
-                ▼
-        [阶段5] GET /result → 展示 factor_card_txt 给用户
-                │
-                ▼
-             下载 factor_card.json / equity_curves.png / trade_log.csv
-             → 归档到 ~/.quant_agent/jobs/{job_id}/
+        └─ done
+             │
+             ▼
+[阶段4] 下载 default_ 文件 → 展示因子卡片 → 讨论下一个因子
 ```
 
 ---
 
 ## 其他接口
 
-### 查看 retest 日志
-
 ```bash
+# 查看 retest 日志
 curl -s "${BASE_URL}/jobs/${JOB_ID}/retest_logs?tail=100"
-```
 
-### 健康检查
-
-```bash
+# 健康检查
 curl -s ${BASE_URL}/health
 ```
-
-返回中 `config_exists: true` 且 `klinedata_exists: true` 表示服务器数据就绪。
 
 ---
 
 ## 向用户汇报进度的节奏
 
 - 提交任务后立即告知 job_id
-- 每 2~3 次轮询后向用户报告一次当前 Step（不必每次都说）
-- Step 11 开始时特别说明「正在提交 Lean 云端回测，约需 3~5 分钟」
-- 遇到 retest 时告知用户「Step 11 编译失败，正在修复 C# 代码后重试」，不要抛出错误
-- 最终结果中重点突出 `factor_status`（pass/fail）、`median_sharpe`、`icir` 三个核心指标
+- 每 2~3 次轮询告知用户当前进度（不必每次都说）
+- 看到 `current_step="4c"` 时说「正在云端回测，约需 3~5 分钟」
+- 遇到 C# 编译失败时告知用户「正在修复代码后重试」，不要抛出错误
+- 结果出来后重点突出 pass/fail、median_sharpe、icir
+- **只展示默认参数版卡片**，展示完直接进入下一个因子
