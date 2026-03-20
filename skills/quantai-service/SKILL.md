@@ -59,9 +59,9 @@ BASE_URL = http://47.129.240.216:8000
 Step 1-3   加载配置、计算前向收益、设置退出规则
 Step 4A    生成 C# 策略代码（strategy.cs）
 Step 4B    计算原始信号（Python 研究镜像）
-Step 4C    默认参数云端 Lean 回测 ← 用户看到的结果来自这里
+Step 4C    默认参数云端回测 ← 用户看到的结果来自这里
 Step 5-10  Z-score / EWMA / 网格搜索（服务端内部分析）
-Step 11    调优参数云端 Lean 回测（服务端内部分析）
+Step 11    调优参数云端回测（服务端内部分析）
 Step 12-16 因子画像、汇总、敏感性、分组、因子档案卡（服务端内部，Agent 无需关心）
 Step 16D   生成默认参数因子档案卡（服务端内部，Agent 无需关心）
 ```
@@ -527,7 +527,7 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs \
 | `CS0128: A local variable named 'xxx' is already defined` | 变量名与模板框架冲突 | 在 `__FACTOR_COMPUTE_BODY__` 中重命名变量（**不要动框架代码**） |
 | `CS1002: ; expected` | C# 语法错误 | 检查 `__FACTOR_COMPUTE_BODY__` 的每行结尾 |
 | `rawSignal` 始终为 0 | `return true` 前忘记给 `rawSignal` 赋值 | 确保所有代码路径都给 `rawSignal` 赋值 |
-| Lean 运行时 NullReference | 访问了未初始化的字段 | 检查 `__FACTOR_INIT__` 是否遗漏了某个字段初始化 |
+| 回测运行时 NullReference | 访问了未初始化的字段 | 检查 `__FACTOR_INIT__` 是否遗漏了某个字段初始化 |
 
 **修复原则**：只修改 `#region FactorComputeBody` 区域内的代码，不要动框架代码。
 
