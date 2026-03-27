@@ -43,7 +43,8 @@ BASE_URL = http://47.129.240.216:8000
         ├── factor_card_default.json← Step 4C 默认参数因子档案卡（Step 4C 完成后下载）
         └── step4c/
             ├── equity_curves.png   ← Step 4C 默认参数权益曲线图（Step 4C 完成后下载）
-            └── trade_log.csv       ← Step 4C 默认参数交易记录（Step 4C 完成后下载）
+            ├── trade_log.csv       ← Step 4C 默认参数交易记录（Step 4C 完成后下载）
+            └── group_return_plot.png ← CS 分组累计收益图（Step 4C 完成后下载，可能不存在）
 ```
 
 > **说明**：服务器内部会跑两次云端回测——Step 4C（默认参数）和 Step 11（调优参数）。
@@ -611,7 +612,13 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_equity_curves.png \
 
 curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
   -o ${JOB_DIR}/step4c/trade_log.csv
+
+curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_group_return_plot.png \
+  -o ${JOB_DIR}/step4c/group_return_plot.png
 ```
+
+> `default_group_return_plot.png` 为分组累计收益图（G1~G5 + Long-Short + Long-Average）。
+> 若文件尚未生成（旧 job 或 Step 12 尚未完成），curl 会收到 404，忽略即可，不影响其他步骤。
 
 #### 4b. 从 factor_card_default.json 读取结果并展示
 
@@ -625,13 +632,18 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
 | `median_annual_return` | 中位年化收益 |
 | `median_max_drawdown` | 中位最大回撤 |
 | `win_rate` | 胜率 |
+| `rank_icir` | RankICIR（截面预测力） |
+| `cs_branch.profile.monotonicity_score` | 分组单调性打分（若有） |
 
-同时打开 `equity_curves.png` 展示权益曲线图。
+同时展示以下图表：
+- `equity_curves.png`：TS 时序策略权益曲线
+- `group_return_plot.png`：CS 截面分组累计收益（若已生成）
 
 #### 4c. 展示结果并进入下一轮
 
 用一段话总结核心表现：
-- 重点突出 `status`（pass/fail）、`median_sharpe`、`icir`
+- **TS 角度**：重点突出 `status`（pass/fail）、`median_sharpe`、胜率
+- **CS 角度**：重点突出 `rank_icir`、分组单调性（`monotonicity_score`）
 - 如果 fail，分析原因并建议改进方向
 
 **展示完结果后，直接与用户讨论下一个因子**——不需要等服务器做其他事情，这个因子的全部工作已经结束。
@@ -661,7 +673,7 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
         └─ current_step >= 5 或 done
              │
              ▼
-[阶段4] 下载 default_ 文件 → 展示因子卡片 → 讨论下一个因子
+[阶段4] 下载 default_ 文件（含 group_return_plot.png）→ 展示因子卡片 → 讨论下一个因子
 ```
 
 ---
