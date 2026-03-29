@@ -60,6 +60,7 @@ BASE_URL = http://47.129.240.216:8000
 Step 1-3   加载配置、计算前向收益、设置退出规则
 Step 4A    生成 C# 策略代码（strategy.cs）
 Step 4B    计算原始信号（Python 研究镜像）
+Step 4L    未来数据泄露检测（仅 custom 因子，5个随机时间点）
 Step 4C    默认参数云端回测 ← 用户看到的结果来自这里
 Step 5-10  Z-score / EWMA / 网格搜索（服务端内部分析）
 Step 11    调优参数云端回测（服务端内部分析）
@@ -67,7 +68,10 @@ Step 12-16 因子画像、汇总、敏感性、分组、因子档案卡（服务
 Step 16D   生成默认参数因子档案卡（服务端内部，Agent 无需关心）
 ```
 
-> Agent 唯一需要介入的场景：C# 编译失败（`failed_step="4c"`）→ 修复 strategy.cs → retest。
+> Agent 需要介入的场景：
+> - C# 编译失败（`failed_step="4c"`）→ 修复 strategy.cs → retest
+> - 未来数据泄露（`failed_step="4l"`）→ Python 插件 `build_signal` 存在未来函数，重写因子后提交新 job（**不能 retest**）
+>
 > Step 4C 回测完成后，Agent 即可获取结果并展示给用户，**无需等待 Step 5 及之后的步骤**。
 
 ---
@@ -261,6 +265,17 @@ def build_signal(
     # ... Python 实现 ...
     return signal.reindex_like(close)
 ```
+
+#### Python build_signal 约束（违反会导致 Step 4L 未来数据检测失败）
+
+| 约束 | 说明 |
+|------|------|
+| 禁止 `shift(-n)` | 负方向移位读取未来价格，最常见的泄露来源 |
+| 禁止 `pct_change(periods=-n)` | 负周期同上 |
+| 禁止 `fillna(method='bfill')` | backward fill 用未来值填补缺失 |
+| 禁止全局统计归一化 | `(x - x.mean()) / x.std()` 对整列计算，含未来数据 |
+| 禁止 `.rolling(n).mean().shift(-k)` | rolling 后再负移位 |
+| `shift` 参数必须为正整数 | `shift(1)` 向后看历史，是安全的 |
 
 #### C# 代码约束（违反会导致 Step 4C 编译失败）
 
@@ -530,6 +545,7 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/status
 |--------|-----------|
 | `queued` / `running`（`current_step` < `"5"`） | 继续等待。每 2~3 次轮询告知用户当前进度 |
 | `running`（`current_step` >= `"5"`）或 `done` | **Step 4C 已完成**，立即进入**阶段 4**获取结果，不再轮询 |
+| `failed`（`failed_step="4l"`） | Python 插件存在未来数据泄露，重写 `build_signal` 后提交**新 job**（禁止 retest） |
 | `failed`（`failed_step="4c"`） | 进入**阶段 3b**修复 C# |
 | `failed`（其他 step） | 告知用户服务器内部错误，无法修复 |
 | `retesting` | 继续等待 |
