@@ -35,7 +35,7 @@ BASE_URL = http://47.129.240.216:8000
 每次开始新任务时，将以下路径记录到工作变量中：
 
 ```
-~/quant_agent/
+./quant_agent/
 └── jobs/
     └── {job_id}/
         ├── plugin.py               ← 提交时上传的因子插件（阶段2完成后保存）
@@ -132,7 +132,7 @@ curl -s ${BASE_URL}/tasks/${TASK_ID}
 写代码前先扫描本地归档，避免重复研究同类因子：
 
 ```bash
-for f in ~/quant_agent/jobs/*/plugin.py; do
+for f in ./quant_agent/jobs/*/plugin.py; do
   [ -f "$f" ] && grep -H "^FACTOR_TYPE" "$f"
 done
 ```
@@ -140,8 +140,8 @@ done
 输出示例：
 
 ```
-/home/ec2-user/quant_agent/jobs/job_20260312_153001_f4a2c1/plugin.py:FACTOR_TYPE = "rsi_oversold_bounce"
-/home/ec2-user/quant_agent/jobs/job_20260315_063800_a1b2c3/plugin.py:FACTOR_TYPE = "bollinger_breakout"
+./quant_agent/jobs/job_20260312_153001_f4a2c1/plugin.py:FACTOR_TYPE = "rsi_oversold_bounce"
+./quant_agent/jobs/job_20260315_063800_a1b2c3/plugin.py:FACTOR_TYPE = "bollinger_breakout"
 ```
 
 - 若用户要求的因子逻辑与已有 `FACTOR_TYPE` **本质相同**（仅参数不同），告知用户已有该因子并展示历史 job_id，询问是改参数重跑还是确认要新建。
@@ -522,8 +522,8 @@ curl -s -X POST ${BASE_URL}/jobs/submit \
 ```bash
 JOB_ID="job_20260312_153001_f4a2c1"
 
-mkdir -p ~/quant_agent/jobs/${JOB_ID}
-cp /tmp/current_plugin.py ~/quant_agent/jobs/${JOB_ID}/plugin.py
+mkdir -p ./quant_agent/jobs/${JOB_ID}
+cp /tmp/current_plugin.py ./quant_agent/jobs/${JOB_ID}/plugin.py
 ```
 
 > **builtin 因子**（`momentum` / `trend` / `mean_revert`）不需要上传 plugin，
@@ -558,9 +558,9 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/status
 轮询时若返回 `"strategy_cs_ready": true`，立即下载并归档 strategy.cs（只需一次）：
 
 ```bash
-mkdir -p ~/quant_agent/jobs/${JOB_ID}
+mkdir -p ./quant_agent/jobs/${JOB_ID}
 curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs \
-  -o ~/quant_agent/jobs/${JOB_ID}/strategy.cs
+  -o ./quant_agent/jobs/${JOB_ID}/strategy.cs
 ```
 
 ---
@@ -579,7 +579,7 @@ curl -s "${BASE_URL}/jobs/${JOB_ID}/logs?tail=80"
 
 ```bash
 curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs \
-  -o ~/quant_agent/jobs/${JOB_ID}/strategy.cs
+  -o ./quant_agent/jobs/${JOB_ID}/strategy.cs
 ```
 
 根据日志中的错误信息修改。常见错误速查表：
@@ -599,7 +599,7 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs \
 
 ```bash
 curl -s -X POST ${BASE_URL}/jobs/${JOB_ID}/retest \
-  -F "strategy_cs=@~/quant_agent/jobs/${JOB_ID}/strategy.cs"
+  -F "strategy_cs=@./quant_agent/jobs/${JOB_ID}/strategy.cs"
 ```
 
 返回 `{ "status": "retesting" }` 后回到**阶段 3**继续轮询。retest 提交后，服务器自动从失败点恢复并跑完所有后续步骤。
@@ -617,7 +617,7 @@ curl -s -X POST ${BASE_URL}/jobs/${JOB_ID}/retest \
 #### 4a. 下载产物文件（Step 4C 完成即可下载）
 
 ```bash
-JOB_DIR=~/quant_agent/jobs/${JOB_ID}
+JOB_DIR=./quant_agent/jobs/${JOB_ID}
 mkdir -p ${JOB_DIR}/step4c
 
 curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_factor_card.json \
