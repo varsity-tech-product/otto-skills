@@ -62,10 +62,7 @@ Step 4A    生成 C# 策略代码（strategy.cs）
 Step 4B    计算原始信号（Python 研究镜像）
 Step 4L    未来数据泄露检测（仅 custom 因子，5个随机时间点）
 Step 4C    默认参数云端回测 ← 用户看到的结果来自这里
-Step 5-10  Z-score / EWMA / 网格搜索（服务端内部分析）
-Step 11    调优参数云端回测（服务端内部分析）
-Step 12-16 因子画像、汇总、敏感性、分组、因子档案卡（服务端内部，Agent 无需关心）
-Step 16D   生成默认参数因子档案卡（服务端内部，Agent 无需关心）
+step 5-11  agent 无需关心
 ```
 
 > Agent 需要介入的场景：
@@ -294,122 +291,6 @@ def build_signal(
 
 #### 参考实现（完整可运行的例子）
 
-<details>
-<summary>示例：RSI 超卖反弹因子（rsi_oversold_bounce）</summary>
-
-```python
-import pandas as pd
-import numpy as np
-from typing import Any, Dict
-
-FACTOR_TYPE = "rsi_oversold_bounce"
-
-FACTOR_DEFAULT_PARAMS = {
-    "rsi_period": 14,
-    "oversold":   30,
-    "overbought": 70,
-}
-
-FACTOR_SECTIONS = {
-    "__FACTOR_DESCRIPTION__": "RSI 超卖反弹：RSI < oversold 做多，RSI > overbought 做空",
-    "__FACTOR_FORMULA__":     "RSI < oversold → +(oversold-RSI)/oversold; RSI > overbought → -(RSI-overbought)/(100-overbought)",
-    "__FACTOR_TYPE__":        "rsi_oversold_bounce",
-    "__FACTOR_PARAM_FIELDS__": (
-        "        private int _rsiPeriod;\n"
-        "        private double _oversold;\n"
-        "        private double _overbought;\n"
-        "        private double _prevGainEma;\n"
-        "        private double _prevLossEma;\n"
-        "        private bool _rsiInitialized;\n"
-    ),
-    "__FACTOR_INIT__": (
-        '            _rsiPeriod = GetIntParameter("rsi-period", 14);\n'
-        '            _oversold = GetDoubleParameter("oversold", 30.0);\n'
-        '            _overbought = GetDoubleParameter("overbought", 70.0);\n'
-        '            _prevGainEma = 0.0;\n'
-        '            _prevLossEma = 0.0;\n'
-        '            _rsiInitialized = false;\n'
-    ),
-    "__FACTOR_LOG__": (
-        '            Log($"[INIT] rsi_period={_rsiPeriod} oversold={_oversold} overbought={_overbought}");\n'
-    ),
-    "__PRICE_WINDOW_EXPR__": "_rsiPeriod + 1",
-    "__EXTRA_BUF_FIELDS__":   "",
-    "__EXTRA_BUF_ENQUEUE__":  "",
-    "__EXTRA_BUF_DEQUEUE__":  "",
-    "__EXTRA_BUF_TOARRAY__":  "",
-    "__FACTOR_COMPUTE_BODY__": """
-            var n = prices.Length;
-            if (n < _rsiPeriod + 1) return false;
-
-            if (!_rsiInitialized)
-            {
-                double sumGain = 0.0, sumLoss = 0.0;
-                for (int i = 1; i < n; i++)
-                {
-                    var change = prices[i] - prices[i - 1];
-                    if (change > 0) sumGain += change;
-                    else sumLoss += Math.Abs(change);
-                }
-                _prevGainEma = sumGain / _rsiPeriod;
-                _prevLossEma = sumLoss / _rsiPeriod;
-                _rsiInitialized = true;
-            }
-            else
-            {
-                var change = prices[n - 1] - prices[n - 2];
-                var gain = change > 0 ? change : 0.0;
-                var loss = change < 0 ? Math.Abs(change) : 0.0;
-                _prevGainEma = (_prevGainEma * (_rsiPeriod - 1) + gain) / _rsiPeriod;
-                _prevLossEma = (_prevLossEma * (_rsiPeriod - 1) + loss) / _rsiPeriod;
-            }
-
-            double rsi;
-            if (_prevLossEma < 1e-12)
-                rsi = 100.0;
-            else
-            {
-                var rs = _prevGainEma / _prevLossEma;
-                rsi = 100.0 - 100.0 / (1.0 + rs);
-            }
-
-            if (rsi < _oversold)
-                rawSignal = (_oversold - rsi) / _oversold;
-            else if (rsi > _overbought)
-                rawSignal = -(rsi - _overbought) / (100.0 - _overbought);
-            else
-                rawSignal = 0.0;
-
-            return true;
-""",
-}
-
-
-def _compute_rsi_wilder(close: pd.DataFrame, period: int) -> pd.DataFrame:
-    delta = close.diff()
-    gain  = delta.clip(lower=0.0)
-    loss  = (-delta).clip(lower=0.0)
-    avg_gain = gain.ewm(com=period - 1, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(com=period - 1, min_periods=period, adjust=False).mean()
-    rs  = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100.0 - 100.0 / (1.0 + rs)
-    rsi.iloc[:period] = np.nan
-    return rsi
-
-
-def build_signal(close: pd.DataFrame, params: Dict[str, Any], **_) -> pd.DataFrame:
-    rsi_period = int(params.get("rsi_period", 14))
-    oversold   = float(params.get("oversold",   30.0))
-    overbought = float(params.get("overbought", 70.0))
-
-    rsi    = _compute_rsi_wilder(close, rsi_period)
-    signal = pd.DataFrame(0.0, index=close.index, columns=close.columns)
-    signal[rsi < oversold]   = (oversold   - rsi[rsi < oversold])   / oversold
-    signal[rsi > overbought] = -(rsi[rsi > overbought] - overbought) / (100.0 - overbought)
-    signal[rsi.isna()]       = np.nan
-    return signal.reindex_like(close)
-```
-
 </details>
 
 插件写好后保存到一个临时路径供提交用，提交后再按 job_id 归档。
@@ -553,6 +434,17 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/status
 
 > **关键规则**：一旦轮询发现 `current_step` 已进入 Step 5 或更后面的步骤，说明 Step 4C（默认参数回测）已完成，Agent 应立即停止轮询并进入阶段 4 获取结果。Step 5-16 是服务端内部调优分析，与用户无关。
 
+#### 等待期间输出量化小知识
+
+每次告知用户进度时，**顺带分享一条量化/金融市场小知识**，让等待不枯燥。内容范围不限，例如：
+- 因子研究方法论（IC、ICIR、Sharpe、最大回撤的含义与局限）
+- 常见 alpha 因子的原理（动量、均值回归、流动性、情绪）
+- 量化策略的坑（过拟合、幸存者偏差、未来函数、交易成本）
+- 加密市场特有现象（资金费率、清算瀑布、链上数据信号）
+- 统计与机器学习基础在量化中的应用
+
+格式：一句话引出话题 + 2~4 句正文，不要太长，像聊天一样自然。每次内容不重复。
+
 #### strategy_cs_ready 标志
 
 轮询时若返回 `"strategy_cs_ready": true`，立即下载并归档 strategy.cs（只需一次）：
@@ -666,36 +558,7 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_group_return_plot.png \
 
 ---
 
-## 完整流程示意图
-
-```
-用户：「研究一个布林带宽度突破因子」
-        │
-        ▼
-[阶段0] 确认 factor_type / factor_name / params
-        │
-        ▼
-[阶段1] 写 plugin.py（C# 片段 + Python build_signal）
-        │
-        ▼
-[阶段2] POST /jobs/submit → 拿到 job_id，归档 plugin.py
-        │
-        ▼
-[阶段3] 轮询等待 Step 4C 完成（current_step >= 5 或 done）
-        │
-        ├─ strategy_cs_ready=true → 下载 strategy.cs
-        ├─ failed (4c) → [阶段3b] 修 C# → retest → 回到轮询
-        │
-        └─ current_step >= 5 或 done
-             │
-             ▼
-[阶段4] 下载 default_ 文件（含 group_return_plot.png）→ 展示因子卡片 → 讨论下一个因子
-```
-
----
-
 ## 其他接口
-
 ```bash
 # 查看 retest 日志
 curl -s "${BASE_URL}/jobs/${JOB_ID}/retest_logs?tail=100"
@@ -703,14 +566,12 @@ curl -s "${BASE_URL}/jobs/${JOB_ID}/retest_logs?tail=100"
 # 健康检查
 curl -s ${BASE_URL}/health
 ```
-
 ---
 
 ## 向用户汇报进度的节奏
 
 - 提交任务后立即告知 job_id
-- 每 2~3 次轮询告知用户当前进度（不必每次都说）
-- 看到 `current_step="4c"` 时说「正在云端回测，约需 3~5 分钟」
+- 每 2~3 次轮询告知用户当前进度，并且介绍量化小知识
 - 遇到 C# 编译失败（仅 Step 4C）时告知用户「正在修复代码后重试」，不要抛出错误
 - **一旦 `current_step` >= 5，立即停止轮询，获取结果**
 - 结果出来后重点突出 pass/fail、median_sharpe、icir
