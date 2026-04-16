@@ -12,7 +12,7 @@ description: >
 ## 服务地址
 
 ```
-BASE_URL = http://47.129.240.216:8000
+BASE_URL = http://54.254.60.77:8000
 ```
 
 > 启动前用 `curl ${BASE_URL}/health` 确认服务在线，若连接失败立刻告知用户。
@@ -44,7 +44,9 @@ BASE_URL = http://47.129.240.216:8000
         └── step4c/
             ├── equity_curves.png   ← Step 4C 默认参数权益曲线图（Step 4C 完成后下载）
             ├── trade_log.csv       ← Step 4C 默认参数交易记录（Step 4C 完成后下载）
-            └── group_return_plot.png ← CS 分组累计收益图（Step 4C 完成后下载，可能不存在）
+            ├── group_return_plot.png ← CS 分组累计收益图（Step 4C 完成后下载，可能不存在）
+            ├── cs_profile_4panel.png ← CS 4合1截面评价图（Step 4C 完成后下载，可能不存在）
+            └── cs_nav_curves.png    ← CS 净值曲线图：多头/空头/多空（Step 4C 完成后下载，可能不存在）
 ```
 
 > **说明**：服务器内部会跑两次云端回测——Step 4C（默认参数）和 Step 11（调优参数）。
@@ -87,6 +89,8 @@ B）自由定义 ── 由你直接描述想研究的因子
 （输入 A 或 B，或直接描述因子想法）
 ```
 
+**仓位策略模式不再询问用户**——每个因子自动提交两个 job（sigmoid_continuous + quantile_discrete），两种模式的结果一起展示对比。
+
 #### A. 打工模式
 
 1. 拉取任务列表并展示：
@@ -112,7 +116,7 @@ TASK_ID="task_momentum_001"
 curl -s ${BASE_URL}/tasks/${TASK_ID}
 ```
 
-4. 阅读 `description` 和 `hints`，**AI 自主决定技术路径**（不需要再问用户实现细节），直接进入**阶段 0b** 提取任务信息。进入阶段 0b 时将 `fwd_period` 采用任务 JSON 中的值（默认 16）。
+4. 阅读 `description` 和 `hints`，**AI 自主决定技术路径**（不需要再问用户实现细节），直接进入**阶段 0b** 提取任务信息。进入阶段 0b 时将 `fwd_period` 采用任务 JSON 中的值（默认 7）。
 
 > 注意：任务永远是 `open` 状态，多个 AI 可以同时研究同一任务，结果越多样越好，**不存在"已被领取"的情况**。
 
@@ -291,6 +295,122 @@ def build_signal(
 
 #### 参考实现（完整可运行的例子）
 
+<details>
+<summary>示例：RSI 超卖反弹因子（rsi_oversold_bounce）</summary>
+
+```python
+import pandas as pd
+import numpy as np
+from typing import Any, Dict
+
+FACTOR_TYPE = "rsi_oversold_bounce"
+
+FACTOR_DEFAULT_PARAMS = {
+    "rsi_period": 14,
+    "oversold":   30,
+    "overbought": 70,
+}
+
+FACTOR_SECTIONS = {
+    "__FACTOR_DESCRIPTION__": "RSI 超卖反弹：RSI < oversold 做多，RSI > overbought 做空",
+    "__FACTOR_FORMULA__":     "RSI < oversold → +(oversold-RSI)/oversold; RSI > overbought → -(RSI-overbought)/(100-overbought)",
+    "__FACTOR_TYPE__":        "rsi_oversold_bounce",
+    "__FACTOR_PARAM_FIELDS__": (
+        "        private int _rsiPeriod;\n"
+        "        private double _oversold;\n"
+        "        private double _overbought;\n"
+        "        private double _prevGainEma;\n"
+        "        private double _prevLossEma;\n"
+        "        private bool _rsiInitialized;\n"
+    ),
+    "__FACTOR_INIT__": (
+        '            _rsiPeriod = GetIntParameter("rsi-period", 14);\n'
+        '            _oversold = GetDoubleParameter("oversold", 30.0);\n'
+        '            _overbought = GetDoubleParameter("overbought", 70.0);\n'
+        '            _prevGainEma = 0.0;\n'
+        '            _prevLossEma = 0.0;\n'
+        '            _rsiInitialized = false;\n'
+    ),
+    "__FACTOR_LOG__": (
+        '            Log($"[INIT] rsi_period={_rsiPeriod} oversold={_oversold} overbought={_overbought}");\n'
+    ),
+    "__PRICE_WINDOW_EXPR__": "_rsiPeriod + 1",
+    "__EXTRA_BUF_FIELDS__":   "",
+    "__EXTRA_BUF_ENQUEUE__":  "",
+    "__EXTRA_BUF_DEQUEUE__":  "",
+    "__EXTRA_BUF_TOARRAY__":  "",
+    "__FACTOR_COMPUTE_BODY__": """
+            var n = prices.Length;
+            if (n < _rsiPeriod + 1) return false;
+
+            if (!_rsiInitialized)
+            {
+                double sumGain = 0.0, sumLoss = 0.0;
+                for (int i = 1; i < n; i++)
+                {
+                    var change = prices[i] - prices[i - 1];
+                    if (change > 0) sumGain += change;
+                    else sumLoss += Math.Abs(change);
+                }
+                _prevGainEma = sumGain / _rsiPeriod;
+                _prevLossEma = sumLoss / _rsiPeriod;
+                _rsiInitialized = true;
+            }
+            else
+            {
+                var change = prices[n - 1] - prices[n - 2];
+                var gain = change > 0 ? change : 0.0;
+                var loss = change < 0 ? Math.Abs(change) : 0.0;
+                _prevGainEma = (_prevGainEma * (_rsiPeriod - 1) + gain) / _rsiPeriod;
+                _prevLossEma = (_prevLossEma * (_rsiPeriod - 1) + loss) / _rsiPeriod;
+            }
+
+            double rsi;
+            if (_prevLossEma < 1e-12)
+                rsi = 100.0;
+            else
+            {
+                var rs = _prevGainEma / _prevLossEma;
+                rsi = 100.0 - 100.0 / (1.0 + rs);
+            }
+
+            if (rsi < _oversold)
+                rawSignal = (_oversold - rsi) / _oversold;
+            else if (rsi > _overbought)
+                rawSignal = -(rsi - _overbought) / (100.0 - _overbought);
+            else
+                rawSignal = 0.0;
+
+            return true;
+""",
+}
+
+
+def _compute_rsi_wilder(close: pd.DataFrame, period: int) -> pd.DataFrame:
+    delta = close.diff()
+    gain  = delta.clip(lower=0.0)
+    loss  = (-delta).clip(lower=0.0)
+    avg_gain = gain.ewm(com=period - 1, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, min_periods=period, adjust=False).mean()
+    rs  = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100.0 - 100.0 / (1.0 + rs)
+    rsi.iloc[:period] = np.nan
+    return rsi
+
+
+def build_signal(close: pd.DataFrame, params: Dict[str, Any], **_) -> pd.DataFrame:
+    rsi_period = int(params.get("rsi_period", 14))
+    oversold   = float(params.get("oversold",   30.0))
+    overbought = float(params.get("overbought", 70.0))
+
+    rsi    = _compute_rsi_wilder(close, rsi_period)
+    signal = pd.DataFrame(0.0, index=close.index, columns=close.columns)
+    signal[rsi < oversold]   = (oversold   - rsi[rsi < oversold])   / oversold
+    signal[rsi > overbought] = -(rsi[rsi > overbought] - overbought) / (100.0 - overbought)
+    signal[rsi.isna()]       = np.nan
+    return signal.reindex_like(close)
+```
+
 </details>
 
 插件写好后保存到一个临时路径供提交用，提交后再按 job_id 归档。
@@ -375,36 +495,50 @@ def build_signal(
 
 ---
 
-### 阶段 2：提交任务
+### 阶段 2：提交任务（双模式）
+
+每个因子**同时提交两个 job**——sigmoid_continuous 和 quantile_discrete：
 
 ```bash
-# 先把 plugin 写到临时文件
-cat > /tmp/current_plugin.py << 'PLUGIN_EOF'
+# 用进程唯一的临时路径，避免多 Agent 并发覆盖
+PLUGIN_TMP="/tmp/plugin_${FACTOR_TYPE}_$$.py"
+
+cat > ${PLUGIN_TMP} << 'PLUGIN_EOF'
 <plugin 内容>
 PLUGIN_EOF
 
+# Job 1: sigmoid_continuous
 curl -s -X POST ${BASE_URL}/jobs/submit \
   -F "factor_kind=custom" \
   -F "factor_type=<factor_type>" \
   -F "factor_name=<factor_name>" \
   -F "params=<JSON字符串，如 {\"rsi_period\":14}>" \
   -F "fwd_period=16" \
-  -F "plugin=@/tmp/current_plugin.py"
+  -F "plugin=@${PLUGIN_TMP}"
+
+# Job 2: quantile_discrete
+curl -s -X POST ${BASE_URL}/jobs/submit \
+  -F "factor_kind=custom" \
+  -F "factor_type=<factor_type>" \
+  -F "factor_name=<factor_name>" \
+  -F "params=<JSON字符串>" \
+  -F "fwd_period=16" \
+  -F "position_mode=quantile_discrete" \
+  -F "entry_q=20" \
+  -F "plugin=@${PLUGIN_TMP}"
 ```
 
-成功返回：
-
-```json
-{ "job_id": "job_20260312_153001_f4a2c1", "status": "queued" }
-```
-
-拿到 `job_id` 后，**将其设为 Shell 变量**并归档插件文件。`JOB_ID` 在当前会话的后续所有 Shell 调用中持续有效，无需写入文件：
+两次提交分别拿到 `job_id`，**设为两个 Shell 变量**：
 
 ```bash
-JOB_ID="job_20260312_153001_f4a2c1"
+JOB_ID_SIG="job_20260312_153001_xxxxxx"   # sigmoid_continuous
+JOB_ID_QD="job_20260312_153002_yyyyyy"    # quantile_discrete
 
-mkdir -p ./quant_agent/jobs/${JOB_ID}
-cp /tmp/current_plugin.py ./quant_agent/jobs/${JOB_ID}/plugin.py
+mkdir -p ./quant_agent/jobs/${JOB_ID_SIG}
+mkdir -p ./quant_agent/jobs/${JOB_ID_QD}
+cp ${PLUGIN_TMP} ./quant_agent/jobs/${JOB_ID_SIG}/plugin.py
+cp ${PLUGIN_TMP} ./quant_agent/jobs/${JOB_ID_QD}/plugin.py
+rm -f ${PLUGIN_TMP}
 ```
 
 > **builtin 因子**（`momentum` / `trend` / `mean_revert`）不需要上传 plugin，
@@ -412,27 +546,30 @@ cp /tmp/current_plugin.py ./quant_agent/jobs/${JOB_ID}/plugin.py
 
 ---
 
-### 阶段 3：轮询等待
+### 阶段 3：轮询等待（双 job 并行）
 
-每 **15 秒**查询一次，最多等待 **30 分钟**。服务器内部步骤全自动执行，Agent 只需等。
+每 **15 秒**同时查询两个 job 的状态，最多等待 **30 分钟**：
 
 ```bash
-curl -s ${BASE_URL}/jobs/${JOB_ID}/status
+curl -s ${BASE_URL}/jobs/${JOB_ID_SIG}/status
+curl -s ${BASE_URL}/jobs/${JOB_ID_QD}/status
 ```
 
-#### Agent 行为速查
+两个 job **独立处理**：一个完成不影响另一个的轮询，一个失败也不影响另一个。
+
+#### Agent 行为速查（对每个 job 独立判断）
 
 | status | Agent 行为 |
 |--------|-----------|
 | `queued` / `running`（`current_step` < `"5"`） | 继续等待。每 2~3 次轮询告知用户当前进度 |
-| `running`（`current_step` >= `"5"`）或 `done` | **Step 4C 已完成**，立即进入**阶段 4**获取结果，不再轮询 |
-| `failed`（`failed_step="4l"`） | Python 插件存在未来数据泄露，重写 `build_signal` 后提交**新 job**（禁止 retest） |
-| `failed`（`failed_step="4c"`） | 进入**阶段 3b**修复 C# |
-| `failed`（其他 step） | 告知用户服务器内部错误，无法修复 |
+| `running`（`current_step` >= `"5"`）或 `done` | **该 job 的 Step 4C 已完成**，标记为可下载 |
+| `failed`（`failed_step="4l"`） | Python 插件存在未来数据泄露，重写 `build_signal` 后提交**新 job**（禁止 retest）。两个 job 共用同一 plugin，需同时重新提交 |
+| `failed`（`failed_step="4c"`） | 进入**阶段 3b**修复该 job 的 C# |
+| `failed`（其他 step） | 告知用户该 job 服务器内部错误，无法修复 |
 | `retesting` | 继续等待 |
 | `retest_failed` | 查看 retest 日志，再次修复 strategy.cs |
 
-> **关键规则**：一旦轮询发现 `current_step` 已进入 Step 5 或更后面的步骤，说明 Step 4C（默认参数回测）已完成，Agent 应立即停止轮询并进入阶段 4 获取结果。Step 5-16 是服务端内部调优分析，与用户无关。
+> **关键规则**：**两个 job 都** `current_step >= 5` 后才进入阶段 4。若其中一个先完成，继续等另一个；若一个彻底失败（非 C# 编译问题），仍用另一个已完成的结果进入阶段 4，向用户说明哪个模式失败了。
 
 #### 等待期间输出量化小知识
 
@@ -447,19 +584,26 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/status
 
 #### strategy_cs_ready 标志
 
-轮询时若返回 `"strategy_cs_ready": true`，立即下载并归档 strategy.cs（只需一次）：
+轮询时若某个 job 返回 `"strategy_cs_ready": true`，立即下载并归档该 job 的 strategy.cs（只需一次）：
 
 ```bash
-mkdir -p ./quant_agent/jobs/${JOB_ID}
-curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs \
-  -o ./quant_agent/jobs/${JOB_ID}/strategy.cs
+# 对 JOB_ID_SIG 和 JOB_ID_QD 分别执行（哪个 ready 就下载哪个）
+mkdir -p ./quant_agent/jobs/${JOB_ID_SIG}
+curl -s ${BASE_URL}/jobs/${JOB_ID_SIG}/files/strategy.cs \
+  -o ./quant_agent/jobs/${JOB_ID_SIG}/strategy.cs
+
+mkdir -p ./quant_agent/jobs/${JOB_ID_QD}
+curl -s ${BASE_URL}/jobs/${JOB_ID_QD}/files/strategy.cs \
+  -o ./quant_agent/jobs/${JOB_ID_QD}/strategy.cs
 ```
 
 ---
 
 ### 阶段 3b：修复 C# 编译错误并 retest
 
-当 `status=failed` 且 `failed_step` 为 `"4c"` 时执行。
+当某个 job `status=failed` 且 `failed_step` 为 `"4c"` 时，对**该 job** 执行修复。
+两个 job 的 C# 模板不同（sigmoid vs quantile），需分别修复。
+以下用 `${JOB_ID}` 代指出错的那个 job_id。
 
 **1. 查看错误日志**
 
@@ -500,37 +644,47 @@ curl -s -X POST ${BASE_URL}/jobs/${JOB_ID}/retest \
 
 ---
 
-### 阶段 4：获取结果、展示给用户、开始下一个因子
+### 阶段 4：获取结果、对比展示、开始下一个因子
 
-> **⚠️ 关键规则**：`current_step >= 5` 时 Step 4C 已完成，**直接下载文件**。
+> **⚠️ 关键规则**：两个 job 的 `current_step >= 5` 时 Step 4C 已完成，**直接下载文件**。
 > **禁止调用 `/result` 接口**——该接口需要整个 pipeline（Step 16D）跑完才返回数据，
 > 而用户只需要看 Step 4C 的默认参数回测结果，不需要等后续步骤。
 
-#### 4a. 下载产物文件（Step 4C 完成即可下载）
+#### 4a. 下载产物文件（对两个 job 分别执行）
 
 ```bash
-JOB_DIR=./quant_agent/jobs/${JOB_ID}
-mkdir -p ${JOB_DIR}/step4c
+# 对 JOB_ID_SIG 和 JOB_ID_QD 分别下载（以下用 JOB_ID 代指）
+for JOB_ID in ${JOB_ID_SIG} ${JOB_ID_QD}; do
+  JOB_DIR=./quant_agent/jobs/${JOB_ID}
+  mkdir -p ${JOB_DIR}/step4c
 
-curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_factor_card.json \
-  -o ${JOB_DIR}/factor_card_default.json
+  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_factor_card.json \
+    -o ${JOB_DIR}/factor_card_default.json
 
-curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_equity_curves.png \
-  -o ${JOB_DIR}/step4c/equity_curves.png
+  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_equity_curves.png \
+    -o ${JOB_DIR}/step4c/equity_curves.png
 
-curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
-  -o ${JOB_DIR}/step4c/trade_log.csv
+  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
+    -o ${JOB_DIR}/step4c/trade_log.csv
 
-curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_group_return_plot.png \
-  -o ${JOB_DIR}/step4c/group_return_plot.png
+  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_group_return_plot.png \
+    -o ${JOB_DIR}/step4c/group_return_plot.png
+
+  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_cs_profile_4panel.png \
+    -o ${JOB_DIR}/step4c/cs_profile_4panel.png
+
+  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_cs_nav_curves.png \
+    -o ${JOB_DIR}/step4c/cs_nav_curves.png
+done
 ```
 
-> `default_group_return_plot.png` 为分组累计收益图（G1~G5 + Long-Short + Long-Average）。
-> 若文件尚未生成（旧 job 或 Step 12 尚未完成），curl 会收到 404，忽略即可，不影响其他步骤。
+> 若文件尚未生成（旧 job 或 Step 12 尚未完成），curl 会收到 404，忽略即可。
 
-#### 4b. 从 factor_card_default.json 读取结果并展示
+#### 4b. 读取两份 factor_card_default.json 并对比展示
 
-下载完成后，直接读取本地的 `factor_card_default.json` 文件，从中提取关键指标：
+分别读取 SIG 和 QD 的 `factor_card_default.json`，提取关键指标做**对比表格**：
+
+**Sigmoid Continuous（SIG job）关注字段：**
 
 | JSON 字段 | 用途 |
 |-----------|------|
@@ -543,22 +697,85 @@ curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_group_return_plot.png \
 | `rank_icir` | RankICIR（截面预测力） |
 | `cs_branch.profile.monotonicity_score` | 分组单调性打分（若有） |
 
-同时展示以下图表：
-- `equity_curves.png`：TS 时序策略权益曲线
-- `group_return_plot.png`：CS 截面分组累计收益（若已生成）
+**Quantile Discrete（QD job）关注字段：**
 
-#### 4c. 展示结果并进入下一轮
+| JSON 字段 | 含义 |
+|-----------|------|
+| `status` | `"pass"` 或 `"fail"` |
+| `median_sharpe` | C# 回测 Sharpe（信号质量参考） |
+| `ts_branch.discrete_turnover` | 离散状态切换频率（每 bar） |
+| `ts_branch.median_hold_bars` | 中位持有时长（bar 数） |
+| `ts_branch.metrics_pool.sharpe_pool` | 组合级 Sharpe（全币池聚合） |
+| `ts_branch.metrics_pool.max_dd_pool` | 组合级最大回撤 |
+| `rank_icir` | RankICIR（截面预测力） |
+| `direction_stability` | 滚动 IC 同号占比（0~1） |
 
-用一段话总结核心表现：
-- **TS 角度**：重点突出 `status`（pass/fail）、`median_sharpe`、胜率
-- **CS 角度**：重点突出 `rank_icir`、分组单调性（`monotonicity_score`）
-- 如果 fail，分析原因并建议改进方向
+> **重要**：QD job 的主要结果来自 Python 侧 Step 8/10 的离散仓位模拟；
+> C# Lean 云端回测（Step 4C）的 `median_sharpe` 口径是 Sigmoid，仅作**信号质量参考**。
+
+同时展示**两个 job 的图表**：
+- `equity_curves.png`：TS 时序策略权益曲线（SIG + QD 各一张）
+- `group_return_plot.png`：CS 截面分组累计收益（两个 job 共用同一份 CS 数据，展示其中一张即可）
+- `cs_profile_4panel.png`：CS 4 合 1 截面评价图（两个 job 共用同一份 CS 数据，展示其中一张即可）
+- `cs_nav_curves.png`：CS 净值曲线图——纯多头/纯空头/多空（两个 job 共用，展示其中一张即可）
+
+#### 4c. 对比总结并进入下一轮
+
+用**对比表格 + 一段话**总结两种模式的核心表现：
+
+```
+| 指标             | Sigmoid Continuous | Quantile Discrete |
+|------------------|--------------------|-------------------|
+| Status           | pass / fail        | pass / fail       |
+| Median Sharpe    | x.xx               | x.xx (信号参考)    |
+| QD Sharpe Pool   | -                  | x.xx              |
+| Rank ICIR        | x.xx               | x.xx              |
+| Win Rate         | xx%                | -                 |
+| Monotonicity     | x.xx               | x.xx              |
+| Hold Bars (QD)   | -                  | xx                |
+| Turnover (QD)    | -                  | x.xxxx            |
+| Dir Stability    | x.xx               | x.xx              |
+```
+
+总结要点：
+- 哪种模式表现更好、各自优劣
+- 如果某个模式 fail，分析原因并建议改进方向
+- 重点说明 `rank_icir` 和 `direction_stability` 是否支持进入因子库
 
 **展示完结果后，直接与用户讨论下一个因子**——不需要等服务器做其他事情，这个因子的全部工作已经结束。
 
 ---
 
+## 完整流程示意图
+
+```
+用户：「研究一个布林带宽度突破因子」
+        │
+        ▼
+[阶段0] 确认 factor_type / factor_name / params
+        │
+        ▼
+[阶段1] 写 plugin.py（C# 片段 + Python build_signal）
+        │
+        ▼
+[阶段2] POST /jobs/submit × 2（sigmoid + quantile）→ 拿到 JOB_ID_SIG + JOB_ID_QD
+        │
+        ▼
+[阶段3] 并行轮询两个 job，等待 Step 4C 完成（current_step >= 5 或 done）
+        │
+        ├─ strategy_cs_ready=true → 下载对应 job 的 strategy.cs
+        ├─ failed (4c) → [阶段3b] 修该 job 的 C# → retest → 回到轮询
+        │
+        └─ 两个 job 都 current_step >= 5 或 done（或一个彻底失败）
+             │
+             ▼
+[阶段4] 下载两个 job 的 default_ 文件 → 对比展示因子卡片 → 讨论下一个因子
+```
+
+---
+
 ## 其他接口
+
 ```bash
 # 查看 retest 日志
 curl -s "${BASE_URL}/jobs/${JOB_ID}/retest_logs?tail=100"
@@ -566,13 +783,15 @@ curl -s "${BASE_URL}/jobs/${JOB_ID}/retest_logs?tail=100"
 # 健康检查
 curl -s ${BASE_URL}/health
 ```
+
 ---
 
 ## 向用户汇报进度的节奏
 
-- 提交任务后立即告知 job_id
-- 每 2~3 次轮询告知用户当前进度，并且介绍量化小知识
+- 提交任务后立即告知两个 job_id（标注 SIG / QD）
+- 每 2~3 次轮询告知用户两个 job 的当前进度（不必每次都说）
+- 看到 `current_step="4c"` 时说「正在云端回测，约需 3~5 分钟」
 - 遇到 C# 编译失败（仅 Step 4C）时告知用户「正在修复代码后重试」，不要抛出错误
-- **一旦 `current_step` >= 5，立即停止轮询，获取结果**
-- 结果出来后重点突出 pass/fail、median_sharpe、icir
+- **两个 job 都 `current_step` >= 5 后，立即停止轮询，获取结果**
+- 结果出来后用对比表格展示两种模式，重点突出 pass/fail、median_sharpe、icir
 - **只展示默认参数版卡片**，展示完直接进入下一个因子
