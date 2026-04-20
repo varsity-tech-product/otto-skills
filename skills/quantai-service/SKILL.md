@@ -250,10 +250,11 @@ def build_signal(
     close: pd.DataFrame,
     params: Dict[str, Any],
     # 声明因子用到的列（框架自动注入，与 close 地位相同）：
-    # open, high, low, volume, quote_volume,
+    # open, high, low, volume,
     # taker_buy_volume, taker_sell_volume,
     # taker_buy_quote_volume, taker_sell_quote_volume,
-    # taker_buy_trades, taker_sell_trades
+    # taker_buy_trades, taker_sell_trades,
+    # quote_volume  ← 计算列，由 taker_buy_quote_volume + taker_sell_quote_volume 合成，原始 CSV/zip 无此列
     **_kwargs,
 ) -> pd.DataFrame:
     """
