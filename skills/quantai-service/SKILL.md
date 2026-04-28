@@ -26,7 +26,7 @@ BASE_URL = http://54.151.204.72:8000
 3. **禁止修改 `/home/ec2-user/quant-factor-loop/` 下的任何文件**，该目录只属于服务器内部。
 4. **轮询时禁止无限等待**：单个 Job 最长等待 30 分钟，超时后告知用户并停止。
 5. **禁止跳过 retest 步骤**：Step 4C 的 C# 编译失败时必须修复 strategy.cs 后 retest，不能直接宣告失败。
-6. **禁止等待 Step 5 及之后的步骤**：Step 4C 完成后立即获取结果，不再轮询。Step 5-16 是服务端内部调优，与用户无关。
+6. **禁止等待 WFO 搜参结果**：Step 4C 完成后立即向用户展示默认参数结果并结束本轮流程。Step 5–16 是服务端异步 WFO 滑动搜参管线（A/B 标准搜参，C 模式严格 WFO），与用户无关，禁止轮询。
 
 ---
 
@@ -38,15 +38,16 @@ BASE_URL = http://54.151.204.72:8000
 ./quant_agent/
 └── jobs/
     └── {job_id}/
-        ├── plugin.py               ← 提交时上传的因子插件（阶段2完成后保存）
-        ├── strategy.cs             ← Step 4a 生成的 C# 策略（strategy_cs_ready=true 后下载）
-        ├── factor_card_default.json← Step 4C 默认参数因子档案卡（Step 4C 完成后下载）
+        ├── plugin.py                  ← 提交时上传的因子插件（阶段2完成后保存）
+        ├── strategy.cs                ← Step 4a 生成的 C# 策略（strategy_cs_ready=true 后下载）
+        ├── factor_card_default.json   ← Step 4C 默认参数因子档案卡（Step 4C 完成后下载）
         └── step4c/
-            ├── equity_curves.png   ← Step 4C 默认参数权益曲线图（Step 4C 完成后下载）
-            ├── trade_log.csv       ← Step 4C 默认参数交易记录（Step 4C 完成后下载）
-            ├── group_return_plot.png ← CS 分组累计收益图（Step 4C 完成后下载，可能不存在）
-            ├── cs_profile_4panel.png ← CS 4合1截面评价图（Step 4C 完成后下载，可能不存在）
-            └── cs_nav_curves.png    ← CS 净值曲线图：多头/空头/多空（Step 4C 完成后下载，可能不存在）
+            ├── equity_curves.png      ← Step 4C 默认参数权益曲线图
+            ├── ts_profile_4panel.png  ← TS 4合1时序画像图（新）
+            ├── trade_log.csv          ← Step 4C 默认参数交易记录
+            ├── group_return_plot.png  ← CS 分组累计收益图（可能不存在）
+            ├── cs_profile_4panel.png  ← CS 4合1截面评价图（可能不存在）
+            └── cs_nav_curves.png      ← CS 净值曲线图：多头/空头/多空（可能不存在）
 ```
 
 > **说明**：服务器内部会跑两次云端回测——Step 4C（默认参数）和 Step 11（调优参数）。
@@ -83,13 +84,18 @@ step 5-11  agent 无需关心
 
 ```
 请问这次要：
-A）打工模式 ── 从服务器领取发布的研究任务，AI 自主设计技术路径
-B）自由定义 ── 由你直接描述想研究的因子
+A）打工模式    ── 从服务器领取发布的研究任务，AI 自主设计技术路径（标准搜参）
+B）自由定义    ── 由你直接描述想研究的因子（标准搜参）
+C）WFO 挑战   ── 自由定义因子 + 滑动窗口严格搜参，通过门槛更高
 
-（输入 A 或 B，或直接描述因子想法）
+（输入 A / B / C，或直接描述因子想法）
 ```
 
 **仓位策略模式不再询问用户**——每个因子自动提交两个 job（sigmoid_continuous + quantile_discrete），两种模式的结果一起展示对比。
+
+**WFO 挑战模式说明**：选 C 时，提交参数附加 `wfo_mode=True`（6M 训练窗口 + 1M 验证窗口滑动搜参），服务器用更严格的时间序列方式寻找最优参数。用户侧展示的结果仍来自 Step 4C 默认参数回测，WFO 结果为服务端内部数据。
+
+> 记录工作模式到变量 `WORK_MODE`（值为 `A` / `B` / `C`），后续阶段依赖此变量。
 
 #### A. 打工模式
 
@@ -123,6 +129,10 @@ curl -s ${BASE_URL}/tasks/${TASK_ID}
 #### B. 自由定义
 
 用户直接描述因子逻辑，进入**阶段 0b**（现有流程，无变化）。
+
+#### C. WFO 挑战
+
+与 B 完全相同——用户描述因子逻辑，进入**阶段 0b**。区别仅在**阶段 2 提交时**附加 WFO 参数，以及**阶段 4c 结尾**输出挑战文案。
 
 ---
 
@@ -500,6 +510,14 @@ def build_signal(
 
 每个因子**同时提交两个 job**——sigmoid_continuous 和 quantile_discrete：
 
+> **WFO 挑战模式（`WORK_MODE=C`）**：在每条 `curl` 命令中额外附加以下参数：
+> ```
+> -F "wfo_mode=true" \
+> -F "wfo_train_months=6" \
+> -F "wfo_test_months=1" \
+> ```
+> A / B 模式不传这三个参数（服务器默认 `wfo_mode=false`）。
+
 ```bash
 # 用进程唯一的临时路径，避免多 Agent 并发覆盖
 PLUGIN_TMP="/tmp/plugin_${FACTOR_TYPE}_$$.py"
@@ -515,6 +533,7 @@ curl -s -X POST ${BASE_URL}/jobs/submit \
   -F "factor_name=<factor_name>" \
   -F "params=<JSON字符串，如 {\"rsi_period\":14}>" \
   -F "fwd_period=16" \
+  # WORK_MODE=C 时追加：-F "wfo_mode=true" -F "wfo_train_months=6" -F "wfo_test_months=1"
   -F "plugin=@${PLUGIN_TMP}"
 
 # Job 2: quantile_discrete
@@ -526,6 +545,7 @@ curl -s -X POST ${BASE_URL}/jobs/submit \
   -F "fwd_period=16" \
   -F "position_mode=quantile_discrete" \
   -F "entry_q=20" \
+  # WORK_MODE=C 时追加：-F "wfo_mode=true" -F "wfo_train_months=6" -F "wfo_test_months=1"
   -F "plugin=@${PLUGIN_TMP}"
 ```
 
@@ -654,6 +674,9 @@ for JOB_ID in ${JOB_ID_SIG} ${JOB_ID_QD}; do
   curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_equity_curves.png \
     -o ${JOB_DIR}/step4c/equity_curves.png
 
+  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_ts_profile_4panel.png \
+    -o ${JOB_DIR}/step4c/ts_profile_4panel.png
+
   curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
     -o ${JOB_DIR}/step4c/trade_log.csv
 
@@ -672,13 +695,18 @@ done
 
 #### 4b. 读取两份 factor_card_default.json 并对比展示
 
-分别读取 SIG 和 QD 的 `factor_card_default.json`，提取关键指标做**对比表格**：
+分别读取 SIG 和 QD 的 `factor_card_default.json`，提取关键指标做**对比表格**。  
+**必须同时汇报 `ts_success`、`cs_success`、`status`（Overall = TS OR CS）**，不要只报单一 pass/fail。
 
 **Sigmoid Continuous（SIG job）关注字段：**
 
 | JSON 字段 | 用途 |
 |-----------|------|
-| `status` | `"pass"` 或 `"fail"` |
+| `ts_success` | TS 是否成功（`true/false`） |
+| `cs_success` | CS 是否成功（`true/false`） |
+| `status` | Overall（`pass/fail`，规则为 TS OR CS） |
+| `ts_fail_reasons` | TS 失败原因列表（若有） |
+| `cs_fail_reasons` | CS 失败原因列表（若有） |
 | `median_sharpe` | 默认参数中位 Sharpe |
 | `icir` | IC 信息比率 |
 | `median_annual_return` | 中位年化收益 |
@@ -691,7 +719,11 @@ done
 
 | JSON 字段 | 含义 |
 |-----------|------|
-| `status` | `"pass"` 或 `"fail"` |
+| `ts_success` | TS 是否成功（`true/false`） |
+| `cs_success` | CS 是否成功（`true/false`） |
+| `status` | Overall（`pass/fail`，规则为 TS OR CS） |
+| `ts_fail_reasons` | TS 失败原因列表（若有） |
+| `cs_fail_reasons` | CS 失败原因列表（若有） |
 | `median_sharpe` | C# 回测 Sharpe（信号质量参考） |
 | `ts_branch.discrete_turnover` | 离散状态切换频率（每 bar） |
 | `ts_branch.median_hold_bars` | 中位持有时长（bar 数） |
@@ -705,6 +737,7 @@ done
 
 同时展示**两个 job 的图表**：
 - `equity_curves.png`：TS 时序策略权益曲线（SIG + QD 各一张）
+- `ts_profile_4panel.png`：TS 4合1时序画像图——IC 均值/胜率/Sharpe 分布/回撤分布（SIG + QD 各一张，**必须展示**）
 - `group_return_plot.png`：CS 截面分组累计收益（两个 job 共用同一份 CS 数据，展示其中一张即可）
 - `cs_profile_4panel.png`：CS 4 合 1 截面评价图（两个 job 共用同一份 CS 数据，展示其中一张即可）
 - `cs_nav_curves.png`：CS 净值曲线图——纯多头/纯空头/多空（两个 job 共用，展示其中一张即可）
@@ -716,7 +749,9 @@ done
 ```
 | 指标             | Sigmoid Continuous | Quantile Discrete |
 |------------------|--------------------|-------------------|
-| Status           | pass / fail        | pass / fail       |
+| TS Success       | true / false       | true / false      |
+| CS Success       | true / false       | true / false      |
+| Overall (TS OR CS) | pass / fail      | pass / fail       |
 | Median Sharpe    | x.xx               | x.xx (信号参考)    |
 | QD Sharpe Pool   | -                  | x.xx              |
 | Rank ICIR        | x.xx               | x.xx              |
@@ -729,10 +764,29 @@ done
 
 总结要点：
 - 哪种模式表现更好、各自优劣
-- 如果某个模式 fail，分析原因并建议改进方向
+- 必须分别解释 TS 是否成功、CS 是否成功，以及 Overall 为什么是当前结果
+- 如果某个模式 Overall fail，分析失败维度（TS/CS）并给出改进方向
 - 重点说明 `rank_icir` 和 `direction_stability` 是否支持进入因子库
 
-**展示完结果后，直接与用户讨论下一个因子**——不需要等服务器做其他事情，这个因子的全部工作已经结束。
+**展示完结果后：**
+
+- **WORK_MODE = A 或 B**：直接与用户讨论下一个因子，这个因子的全部工作已经结束。
+
+- **WORK_MODE = C（WFO 挑战）**：在进入下一个因子前，输出以下固定文案：
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🏆  因子已提交 WFO 挑战
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+您的因子已在后台进入严格挑战流程：
+服务器将以 6M 训练 + 1M 验证的滑动窗口
+跨越完整历史周期搜索最优参数组合。
+
+若因子通过挑战，将会通知您。
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+输出完文案后，直接与用户讨论下一个因子。
 
 ---
 
@@ -742,6 +796,12 @@ done
 用户：「研究一个布林带宽度突破因子」
         │
         ▼
+[阶段-1] 选择工作模式
+         A：打工模式（标准搜参）
+         B：自由定义（标准搜参）
+         C：WFO 挑战（滑动窗口严格搜参）
+        │
+        ▼
 [阶段0] 确认 factor_type / factor_name / params
         │
         ▼
@@ -749,7 +809,7 @@ done
         │
         ▼
 [阶段2] POST /jobs/submit × 2（sigmoid + quantile）→ 拿到 JOB_ID_SIG + JOB_ID_QD
-        │
+        │  C 模式额外附加：wfo_mode=true / wfo_train_months=6 / wfo_test_months=1
         ▼
 [阶段3] 并行轮询两个 job，等待 Step 4C 完成（current_step >= 5 或 done）
         │
@@ -759,7 +819,11 @@ done
         └─ 两个 job 都 current_step >= 5 或 done（或一个彻底失败）
              │
              ▼
-[阶段4] 下载两个 job 的 default_ 文件 → 对比展示因子卡片 → 讨论下一个因子
+[阶段4] 下载两个 job 的 default_ 文件（含新增 ts_profile_4panel.png）
+        → 对比展示因子卡片 + TS 4合1画像图
+        → C 模式：输出 WFO 挑战文案「因子已提交挑战，若通过挑战会通知您」
+        → 讨论下一个因子
+（Step 5–16 服务端异步运行，用户侧流程到此完全结束）
 ```
 
 ---
@@ -778,10 +842,27 @@ curl -s ${BASE_URL}/health
 
 ## 向用户汇报进度的节奏
 
-- 提交任务后立即告知两个 job_id（标注 SIG / QD）
-- 每 2~3 次轮询告知用户两个 job 的当前进度（不必每次都说）
-- 看到 `current_step="4c"` 时说「正在云端回测，约需 3~5 分钟」
+- 提交成功后立即告知两个任务编号（标注「连续模式」/「梯度模式」，不用解释技术含义）
+- 每 2~3 次等待间隔告知用户两个任务的当前情况（不必每次都说）
+- 看到 `current_step="4c"` 时说时说「正在跑回测，约需 3~5 分钟」
 - 遇到 C# 编译失败（仅 Step 4C）时告知用户「正在修复代码后重试」，不要抛出错误
 - **两个 job 都 `current_step` >= 5 后，立即停止轮询，获取结果**
-- 结果出来后用对比表格展示两种模式，重点突出 pass/fail、median_sharpe、icir
-- **只展示默认参数版卡片**，展示完直接进入下一个因子
+- 结果出来后用对比表格展示两种模式，重点突出「时序测试是否通过」「截面测试是否通过」「综合结论」、Sharpe、ICIR
+- **只展示默认参数版结果**，展示完直接进入下一个因子
+
+### ⛔ 措辞禁忌（对用户说话时绝对不出现）
+
+以下是内部术语，只能出现在 Agent 的处理逻辑里，**不能直接说给用户听**：
+
+| 禁止说的词 | 可以替换成 |
+|-----------|-----------|
+| `Step 4C` / `current_step` / `Step 4L` | 「回测阶段」/ 「检测阶段」 |
+| `strategy_cs_ready` | 不需要跟用户提 |
+| `sigmoid_continuous` | 「连续模式」，或直接略去不解释 |
+| `quantile_discrete` | 「梯度模式」，或直接略去不解释 |
+| `SIG job` / `QD job` | 「连续模式任务」/「梯度模式任务」 |
+| `C# 编译失败` | 「策略代码遇到了小问题」 |
+| `retest` / `轮询` | 「重新测试」/ 「等待结果」 |
+| `plugin.py` / `build_signal` / `FACTOR_SECTIONS` | 不需要跟用户提 |
+| `WFO` / `wfo_mode` | 「严格挑战模式」（仅 C 模式时可说） |
+| `ts_success` / `cs_success` / `rank_icir` 等字段名 | 用中文说意思，如「时序测试通过」「截面预测力」 |
