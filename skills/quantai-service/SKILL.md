@@ -26,7 +26,7 @@ BASE_URL = http://54.151.204.72:8000
 3. **禁止修改 `/home/ec2-user/quant-factor-loop/` 下的任何文件**，该目录只属于服务器内部。
 4. **轮询时禁止无限等待**：单个 Job 最长等待 30 分钟，超时后告知用户并停止。
 5. **禁止跳过 retest 步骤**：Step 4C 的 C# 编译失败时必须修复 strategy.cs 后 retest，不能直接宣告失败。
-6. **禁止等待 WFO 搜参结果**：Step 4C 完成后立即向用户展示默认参数结果并结束本轮流程。Step 5–16 是服务端异步 WFO 滑动搜参管线（A/B 标准搜参，C 模式严格 WFO），与用户无关，禁止轮询。
+6. **禁止等待搜参结果**：Step 4C 完成后立即向用户展示默认参数结果并结束本轮流程。Step 5–16 是服务端异步搜参管线，与用户无关，禁止轮询。
 
 ---
 
@@ -84,18 +84,15 @@ step 5-11  agent 无需关心
 
 ```
 请问这次要：
-A）打工模式    ── 从服务器领取发布的研究任务，AI 自主设计技术路径（标准搜参）
-B）自由定义    ── 由你直接描述想研究的因子（标准搜参）
-C）WFO 挑战   ── 自由定义因子 + 滑动窗口严格搜参，通过门槛更高
+A）打工模式    ── 从服务器领取发布的研究任务，AI 自主设计技术路径
+B）自由定义    ── 由你直接描述想研究的因子
 
-（输入 A / B / C，或直接描述因子想法）
+（输入 A / B，或直接描述因子想法）
 ```
 
 **仓位策略模式不再询问用户**——每个因子自动提交两个 job（sigmoid_continuous + quantile_discrete），两种模式的结果一起展示对比。
 
-**WFO 挑战模式说明**：选 C 时，提交参数附加 `wfo_mode=True`（6M 训练窗口 + 1M 验证窗口滑动搜参），服务器用更严格的时间序列方式寻找最优参数。用户侧展示的结果仍来自 Step 4C 默认参数回测，WFO 结果为服务端内部数据。
-
-> 记录工作模式到变量 `WORK_MODE`（值为 `A` / `B` / `C`），后续阶段依赖此变量。
+> 记录工作模式到变量 `WORK_MODE`（值为 `A` / `B`），后续阶段依赖此变量。
 
 #### A. 打工模式
 
@@ -129,10 +126,6 @@ curl -s ${BASE_URL}/tasks/${TASK_ID}
 #### B. 自由定义
 
 用户直接描述因子逻辑，进入**阶段 0b**（现有流程，无变化）。
-
-#### C. WFO 挑战
-
-与 B 完全相同——用户描述因子逻辑，进入**阶段 0b**。区别仅在**阶段 2 提交时**附加 WFO 参数，以及**阶段 4c 结尾**输出挑战文案。
 
 ---
 
@@ -510,14 +503,6 @@ def build_signal(
 
 每个因子**同时提交两个 job**——sigmoid_continuous 和 quantile_discrete：
 
-> **WFO 挑战模式（`WORK_MODE=C`）**：在每条 `curl` 命令中额外附加以下参数：
-> ```
-> -F "wfo_mode=true" \
-> -F "wfo_train_months=6" \
-> -F "wfo_test_months=1" \
-> ```
-> A / B 模式不传这三个参数（服务器默认 `wfo_mode=false`）。
-
 ```bash
 # 用进程唯一的临时路径，避免多 Agent 并发覆盖
 PLUGIN_TMP="/tmp/plugin_${FACTOR_TYPE}_$$.py"
@@ -533,7 +518,6 @@ curl -s -X POST ${BASE_URL}/jobs/submit \
   -F "factor_name=<factor_name>" \
   -F "params=<JSON字符串，如 {\"rsi_period\":14}>" \
   -F "fwd_period=16" \
-  # WORK_MODE=C 时追加：-F "wfo_mode=true" -F "wfo_train_months=6" -F "wfo_test_months=1"
   -F "plugin=@${PLUGIN_TMP}"
 
 # Job 2: quantile_discrete
@@ -545,7 +529,6 @@ curl -s -X POST ${BASE_URL}/jobs/submit \
   -F "fwd_period=16" \
   -F "position_mode=quantile_discrete" \
   -F "entry_q=20" \
-  # WORK_MODE=C 时追加：-F "wfo_mode=true" -F "wfo_train_months=6" -F "wfo_test_months=1"
   -F "plugin=@${PLUGIN_TMP}"
 ```
 
@@ -772,22 +755,6 @@ done
 
 - **WORK_MODE = A 或 B**：直接与用户讨论下一个因子，这个因子的全部工作已经结束。
 
-- **WORK_MODE = C（WFO 挑战）**：在进入下一个因子前，输出以下固定文案：
-
-```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🏆  因子已提交 WFO 挑战
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-您的因子已在后台进入严格挑战流程：
-服务器将以 6M 训练 + 1M 验证的滑动窗口
-跨越完整历史周期搜索最优参数组合。
-
-若因子通过挑战，将会通知您。
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-```
-
-输出完文案后，直接与用户讨论下一个因子。
-
 ---
 
 ## 完整流程示意图
@@ -797,9 +764,8 @@ done
         │
         ▼
 [阶段-1] 选择工作模式
-         A：打工模式（标准搜参）
-         B：自由定义（标准搜参）
-         C：WFO 挑战（滑动窗口严格搜参）
+         A：打工模式
+         B：自由定义
         │
         ▼
 [阶段0] 确认 factor_type / factor_name / params
@@ -809,7 +775,7 @@ done
         │
         ▼
 [阶段2] POST /jobs/submit × 2（sigmoid + quantile）→ 拿到 JOB_ID_SIG + JOB_ID_QD
-        │  C 模式额外附加：wfo_mode=true / wfo_train_months=6 / wfo_test_months=1
+        │
         ▼
 [阶段3] 并行轮询两个 job，等待 Step 4C 完成（current_step >= 5 或 done）
         │
@@ -821,7 +787,6 @@ done
              ▼
 [阶段4] 下载两个 job 的 default_ 文件（含新增 ts_profile_4panel.png）
         → 对比展示因子卡片 + TS 4合1画像图
-        → C 模式：输出 WFO 挑战文案「因子已提交挑战，若通过挑战会通知您」
         → 讨论下一个因子
 （Step 5–16 服务端异步运行，用户侧流程到此完全结束）
 ```
@@ -864,5 +829,4 @@ curl -s ${BASE_URL}/health
 | `C# 编译失败` | 「策略代码遇到了小问题」 |
 | `retest` / `轮询` | 「重新测试」/ 「等待结果」 |
 | `plugin.py` / `build_signal` / `FACTOR_SECTIONS` | 不需要跟用户提 |
-| `WFO` / `wfo_mode` | 「严格挑战模式」（仅 C 模式时可说） |
 | `ts_success` / `cs_success` / `rank_icir` 等字段名 | 用中文说意思，如「时序测试通过」「截面预测力」 |
