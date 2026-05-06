@@ -36,6 +36,7 @@ BASE_URL = http://54.151.204.72:8000
 
 ```
 ./quant_agent/
+├── factor_registry.jsonl         ← 因子归档索引（factor_type + formula + job_id）
 └── jobs/
     └── {job_id}/
         ├── plugin.py                  ← 提交时上传的因子插件（阶段2完成后保存）
@@ -133,24 +134,67 @@ curl -s ${BASE_URL}/tasks/${TASK_ID}
 
 **0a. 查重——检查已研究过的因子**
 
-写代码前先扫描本地归档，避免重复研究同类因子：
+写代码前先使用 `factor_registry.jsonl` 做归档查重（首次自动初始化）：
 
 ```bash
-for f in ./quant_agent/jobs/*/plugin.py; do
-  [ -f "$f" ] && grep -H "^FACTOR_TYPE" "$f"
-done
+REGISTRY=./quant_agent/factor_registry.jsonl
+mkdir -p ./quant_agent
+
+# 首次初始化：从历史 jobs 构建 registry
+# 去重规则：同一分钟内、factor_type+formula 相同且时间相差 <= 10 秒，视为同一轮 SIG/QD 双提交，只保留 1 条
+if [ ! -s "$REGISTRY" ]; then
+  TMP=$(mktemp)
+  for f in ./quant_agent/jobs/job_*/plugin.py; do
+    [ -f "$f" ] || continue
+    job_id=$(basename "$(dirname "$f")")
+    factor_type=$(sed -n 's/^FACTOR_TYPE[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$f" | head -n 1)
+    formula=$(sed -n 's/^[[:space:]]*"__FACTOR_FORMULA__":[[:space:]]*"\(.*\)",[[:space:]]*$/\1/p' "$f" | head -n 1)
+    [ -n "$factor_type" ] || continue
+    ts=$(printf '%s' "$job_id" | sed -n 's/^job_\([0-9]\{8\}\)_\([0-9]\{6\}\)_.*/\1\2/p')
+    [ -n "$ts" ] || continue
+    minute=${ts%??}
+    second=${ts#????????????}
+    printf '%s\t%s\t%s\t%s\t%s\n' "$factor_type" "$formula" "$minute" "$second" "$job_id" >> "$TMP"
+  done
+
+  sort -t $'\t' -k1,1 -k2,2 -k3,3 -k4,4n "$TMP" | awk -F '\t' '
+  function esc(s){gsub(/\\/,"\\\\",s); gsub(/"/,"\\\"",s); gsub(/\r/," ",s); gsub(/\n/," ",s); return s}
+  function emit(ft, fm, jb){print "{\"factor_type\":\"" esc(ft) "\",\"formula\":\"" esc(fm) "\",\"job_id\":\"" jb "\"}"}
+  {
+    key=$1 "\t" $2 "\t" $3
+    sec=$4+0
+    job=$5
+    if (!(key in has)) {
+      has[key]=1; psec[key]=sec; pjob[key]=job; pft[key]=$1; pfm[key]=$2
+      next
+    }
+    if ((sec - psec[key]) <= 10) {
+      emit(pft[key], pfm[key], pjob[key])
+      delete has[key]; delete psec[key]; delete pjob[key]; delete pft[key]; delete pfm[key]
+    } else {
+      emit(pft[key], pfm[key], pjob[key])
+      has[key]=1; psec[key]=sec; pjob[key]=job; pft[key]=$1; pfm[key]=$2
+    }
+  }
+  END{
+    for (k in has) emit(pft[k], pfm[k], pjob[k])
+  }' > "$REGISTRY"
+
+  rm -f "$TMP"
+fi
+
+# 读取归档（由 Agent 判断是否与本次因子“本质重复”，不限制为 factor_type 相同）
+cat "$REGISTRY"
 ```
 
-输出示例：
+单行记录格式示例：
 
 ```
-./quant_agent/jobs/job_20260312_153001_f4a2c1/plugin.py:FACTOR_TYPE = "rsi_oversold_bounce"
-./quant_agent/jobs/job_20260315_063800_a1b2c3/plugin.py:FACTOR_TYPE = "bollinger_breakout"
+{"factor_type":"rsi_oversold_bounce","formula":"RSI < oversold -> long; RSI > overbought -> short","job_id":"job_20260312_153001_f4a2c1"}
 ```
 
-- 若用户要求的因子逻辑与已有 `FACTOR_TYPE` **本质相同**（仅参数不同），告知用户已有该因子并展示历史 job_id，询问是改参数重跑还是确认要新建。
+- 若本次逻辑与历史记录**本质相同**（仅参数不同），告知用户已有该因子并展示历史 `job_id`，询问是改参数重跑还是确认新建。
 - 若逻辑有实质区别（如 RSI 超卖 vs RSI 背离），正常继续。
-- 归档目录为空时跳过此步。
 
 **0b. 提取任务信息**
 
@@ -542,6 +586,15 @@ mkdir -p ./quant_agent/jobs/${JOB_ID_SIG}
 mkdir -p ./quant_agent/jobs/${JOB_ID_QD}
 cp ${PLUGIN_TMP} ./quant_agent/jobs/${JOB_ID_SIG}/plugin.py
 cp ${PLUGIN_TMP} ./quant_agent/jobs/${JOB_ID_QD}/plugin.py
+
+# 归档：SIG/QD 只写一条记录（job_id 使用 JOB_ID_SIG）
+REGISTRY=./quant_agent/factor_registry.jsonl
+[ -f "$REGISTRY" ] || : > "$REGISTRY"
+FORMULA_TEXT=$(awk -F'"' '/__FACTOR_FORMULA__/ {print $4; exit}' "./quant_agent/jobs/${JOB_ID_SIG}/plugin.py")
+FORMULA_ESC=$(printf '%s' "${FORMULA_TEXT}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+printf '{"factor_type":"%s","formula":"%s","job_id":"%s"}\n' \
+  "${FACTOR_TYPE}" "${FORMULA_ESC}" "${JOB_ID_SIG}" >> "$REGISTRY"
+
 rm -f ${PLUGIN_TMP}
 ```
 
