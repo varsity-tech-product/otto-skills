@@ -1,147 +1,148 @@
 ---
 name: quantai-service
 description: >
-  Crypto 单因子量化研究服务 Skill。当用户说"写一个因子"、"研究因子"、"量化打工"、
-  "提交因子"、"因子回测"时加载此 Skill。
-  Agent 负责编写因子插件代码并通过 HTTP 接口与服务器交互，
-  服务器负责所有数据处理和计算，Agent 本地无需任何市场数据。
+  Crypto single-factor quant research service skill. Load this skill when users ask to
+  write a factor, research a factor, auto-discover/mine factors, submit a factor, or run
+  factor backtests. The Agent writes factor plugin code and interacts with the service
+  over HTTP. The server handles all data processing and computation; the Agent does not
+  need any local market data.
 ---
 
-# QuantAI Service — Agent 操作手册
+# QuantAI Service — Agent Runbook
 
-## 服务地址
+## Service Endpoint
 
 ```
 BASE_URL = http://54.151.204.72:8000
 ```
 
-> 启动前用 `curl ${BASE_URL}/health` 确认服务在线，若连接失败立刻告知用户。
+> Before starting, run `curl ${BASE_URL}/health` to confirm the service is online. If the connection fails, notify the user immediately.
 
 ---
 
-## ⛔ 严禁行为
+## ⛔ Forbidden Actions
 
-1. **禁止在本地运行任何 quant-factor-loop 脚本**（`run_workflow.py`、`step*.py` 等），所有计算都在服务器上。
-2. **禁止下载或存储 parquet 数据文件**，不要尝试访问服务器上的数据文件。
-3. **禁止修改 `/home/ec2-user/quant-factor-loop/` 下的任何文件**，该目录只属于服务器内部。
-4. **轮询时禁止无限等待**：单个 Job 最长等待 30 分钟，超时后告知用户并停止。
-5. **禁止跳过 retest 步骤**：Step 4C 的 C# 编译失败时必须修复 strategy.cs 后 retest，不能直接宣告失败。
-6. **禁止等待搜参结果**：Step 4C 完成后立即向用户展示默认参数结果并结束本轮流程。Step 5–16 是服务端异步搜参管线，与用户无关，禁止轮询。
+1. **Do not run any quant-factor-loop scripts locally** (`run_workflow.py`, `step*.py`, etc.). All computation runs on the server.
+2. **Do not download or store parquet data files**. Do not attempt to access data files on the server.
+3. **Do not modify any file under `/home/ec2-user/quant-factor-loop/`**. That directory belongs to the server internals only.
+4. **Do not wait forever when polling**: max 30 minutes per Job; on timeout, notify the user and stop.
+5. **Do not skip retest**: when Step 4C C# compilation fails, fix `strategy.cs` and retest. Do not declare failure directly.
+6. **Do not wait for parameter search**: as soon as Step 4C completes, present the default-parameter results to the user and end this round. Steps 5–16 are the server-side async parameter-search pipeline — irrelevant to the user, do not poll.
 
 ---
 
-## Agent 本地约定路径
+## Agent Local Paths
 
-每次开始新任务时，将以下路径记录到工作变量中：
+Record these paths into working variables at the start of each new task:
 
 ```
 ./quant_agent/
-├── factor_registry.jsonl         ← 因子归档索引（factor_type + formula + job_id）
+├── factor_registry.jsonl         ← factor archive index (factor_type + formula + job_id)
 └── jobs/
     └── {job_id}/
-        ├── plugin.py                  ← 提交时上传的因子插件（阶段2完成后保存）
-        ├── strategy.cs                ← Step 4a 生成的 C# 策略（strategy_cs_ready=true 后下载）
-        ├── factor_card_default.json   ← Step 4C 默认参数因子档案卡（Step 4C 完成后下载）
+        ├── plugin.py                  ← uploaded factor plugin (saved after phase 2)
+        ├── strategy.cs                ← C# strategy from Step 4a (download when strategy_cs_ready=true)
+        ├── factor_card_default.json   ← Step 4C default-parameter factor card (download after Step 4C)
         └── step4c/
-            ├── equity_curves.png      ← Step 4C 默认参数权益曲线图
-            ├── ts_profile_4panel.png  ← TS 4合1时序画像图（新）
-            ├── trade_log.csv          ← Step 4C 默认参数交易记录
-            ├── group_return_plot.png  ← CS 分组累计收益图（可能不存在）
-            ├── cs_profile_4panel.png  ← CS 4合1截面评价图（可能不存在）
-            └── cs_nav_curves.png      ← CS 净值曲线图：多头/空头/多空（可能不存在）
+            ├── equity_curves.png      ← Step 4C default-parameter equity curve
+            ├── ts_profile_4panel.png  ← TS 4-in-1 time-series profile (new)
+            ├── trade_log.csv          ← Step 4C default-parameter trade log
+            ├── group_return_plot.png  ← CS grouped cumulative return plot (may not exist)
+            ├── cs_profile_4panel.png  ← CS 4-in-1 cross-section profile (may not exist)
+            └── cs_nav_curves.png      ← CS NAV curves: long / short / long-short (may not exist)
 ```
 
-> **说明**：服务器内部会跑两次云端回测——Step 4C（默认参数）和 Step 11（调优参数）。
-> Agent 只下载并展示给用户**默认参数版**（`default_` 前缀文件），调优参数版留在服务端。
+> **Note**: the server runs two cloud backtests internally — Step 4C (default params) and Step 11 (tuned params). The Agent only downloads and presents the **default-parameter** version (`default_` prefix files) to the user. The tuned version stays on the server.
 
 ---
 
-## 服务器内部流程（Agent 无需操作，仅供了解）
+## Internal Server Pipeline (Reference Only — Agent Doesn't Operate It)
 
-提交任务后，服务器自动执行以下步骤，**Agent 全程只需轮询等待**：
+After job submission, the server runs the following automatically. **The Agent only polls and waits**:
 
 ```
-Step 1-3   加载配置、计算前向收益、设置退出规则
-Step 4A    生成 C# 策略代码（strategy.cs）
-Step 4B    计算原始信号（Python 研究镜像）
-Step 4L    未来数据泄露检测（仅 custom 因子，5个随机时间点）
-Step 4C    默认参数云端回测 ← 用户看到的结果来自这里
-step 5-11  agent 无需关心
+Step 1-3   load config, compute forward returns, set exit rule
+Step 4A    generate C# strategy code (strategy.cs)
+Step 4B    compute raw signal (Python research mirror)
+Step 4L    future-data leakage check (custom factors only, 5 random timestamps)
+Step 4C    default-parameter cloud backtest  ← user-facing results come from here
+Step 5-11  Agent does not need to care
 ```
 
-> Agent 需要介入的场景：
-> - C# 编译失败（`failed_step="4c"`）→ 修复 strategy.cs → retest
-> - 未来数据泄露（`failed_step="4l"`）→ Python 插件 `build_signal` 存在未来函数，重写因子后提交新 job（**不能 retest**）
+> Agent intervention cases:
+> - C# compile failure (`failed_step="4c"`) → fix strategy.cs → retest
+> - Future-data leakage (`failed_step="4l"`) → Python plugin `build_signal` contains a future function; rewrite the factor and submit a **new job** (retest is not allowed)
 >
-> Step 4C 回测完成后，Agent 即可获取结果并展示给用户，**无需等待 Step 5 及之后的步骤**。
+> Once Step 4C finishes, the Agent can fetch results and present them to the user. **No need to wait for Step 5 or beyond.**
 
 ---
 
-## Agent 工作流程（必须按顺序执行）
+## Agent Workflow (Must Follow Order)
 
-### 阶段 -1：选择工作模式
+### Phase -1: Choose Work Mode
 
-每次启动时，**第一步**先询问用户选择工作模式：
+At each session start, **the first thing** is to ask the user which work mode to use:
 
 ```
-请问这次要：
-A）打工模式    ── 从服务器领取发布的研究任务，AI 自主设计技术路径
-B）自由定义    ── 由你直接描述想研究的因子
+This session, choose:
+A) Auto-Discovery Mode — AI autonomously picks tasks from the server's published task pool and designs the implementation path on its own
+B) Free Mode           — you directly describe the factor you want to research
 
-（输入 A / B，或直接描述因子想法）
+(Enter A / B, or directly describe a factor idea)
 ```
 
-**仓位策略模式不再询问用户**——每个因子自动提交两个 job（sigmoid_continuous + quantile_discrete），两种模式的结果一起展示对比。
+**Position-strategy mode is no longer asked** — every factor automatically submits two jobs (sigmoid_continuous + quantile_discrete), and both modes' results are presented side by side.
 
-> 记录工作模式到变量 `WORK_MODE`（值为 `A` / `B`），后续阶段依赖此变量。
+> Save the work mode to variable `WORK_MODE` (value `A` / `B`); later phases depend on this variable.
 
-#### A. 打工模式
+#### A. Auto-Discovery Mode
 
-1. 拉取任务列表并展示：
+1. Fetch the task list:
 
 ```bash
 curl -s ${BASE_URL}/tasks
 ```
 
-输出示例：
+Example output:
 ```json
 [
-  {"task_id": "task_momentum_001", "title": "短期价格动量", "category": "momentum"},
-  {"task_id": "task_volume_001",   "title": "主动成交量失衡", "category": "volume"}
+  {"task_id": "task_momentum_001", "title": "Short-Term Price Momentum", "category": "momentum"},
+  {"task_id": "task_volume_001",   "title": "Aggressive Volume Imbalance", "category": "volume"}
 ]
 ```
 
-2. 请用户选择一个任务（或 AI 根据本地归档自动选一个尚未研究过的类别）。
+2. **AI autonomously picks one task**: prefer a category not yet (or rarely) studied based on `factor_registry.jsonl`. Do not ask the user. After picking, immediately tell the user which task was chosen (show `task_id` and `title`), then continue.
 
-3. 拉取选中任务的完整描述：
+3. Fetch the full description of the chosen task:
 
 ```bash
 TASK_ID="task_momentum_001"
 curl -s ${BASE_URL}/tasks/${TASK_ID}
 ```
 
-4. 阅读 `description` 和 `hints`，**AI 自主决定技术路径**（不需要再问用户实现细节），直接进入**阶段 0b** 提取任务信息。进入阶段 0b 时将 `fwd_period` 采用任务 JSON 中的值（默认 7）。
+4. Read `description` and `hints`, **AI autonomously decides the technical path** (no need to ask the user about implementation details), and proceeds directly to **phase 0b** to extract task info. When entering phase 0b, use the `fwd_period` value from the task JSON (default 7).
 
-> 注意：任务永远是 `open` 状态，多个 AI 可以同时研究同一任务，结果越多样越好，**不存在"已被领取"的情况**。
+> Note: tasks are always in `open` state, multiple AIs can research the same task in parallel — the more diverse the results the better. **There is no "claimed" state.**
 
-#### B. 自由定义
+#### B. Free Mode
 
-用户直接描述因子逻辑，进入**阶段 0b**（现有流程，无变化）。
+The user directly describes the factor logic; proceed to **phase 0b** (existing flow, unchanged).
 
 ---
 
-### 阶段 0：确认任务
+### Phase 0: Confirm Task
 
-**0a. 查重——检查已研究过的因子**
+**0a. Dedup Check — Inspect Already-Researched Factors**
 
-写代码前先使用 `factor_registry.jsonl` 做归档查重（首次自动初始化）：
+Before writing any code, run dedup against `factor_registry.jsonl` (auto-initialize on first run):
 
 ```bash
 REGISTRY=./quant_agent/factor_registry.jsonl
 mkdir -p ./quant_agent
 
-# 首次初始化：从历史 jobs 构建 registry
-# 去重规则：同一分钟内、factor_type+formula 相同且时间相差 <= 10 秒，视为同一轮 SIG/QD 双提交，只保留 1 条
+# First-run init: build registry from historical jobs
+# Dedup rule: same factor_type+formula within the same minute and <= 10 seconds apart
+# is treated as a single SIG/QD dual-submit round; keep only one entry.
 if [ ! -s "$REGISTRY" ]; then
   TMP=$(mktemp)
   for f in ./quant_agent/jobs/job_*/plugin.py; do
@@ -183,110 +184,110 @@ if [ ! -s "$REGISTRY" ]; then
   rm -f "$TMP"
 fi
 
-# 读取归档（由 Agent 判断是否与本次因子“本质重复”，不限制为 factor_type 相同）
+# Read archive (Agent decides whether the new factor is "essentially duplicate", not limited to factor_type)
 cat "$REGISTRY"
 ```
 
-单行记录格式示例：
+Example single-line record:
 
 ```
 {"factor_type":"rsi_oversold_bounce","formula":"RSI < oversold -> long; RSI > overbought -> short","job_id":"job_20260312_153001_f4a2c1"}
 ```
 
-- 若本次逻辑与历史记录**本质相同**（仅参数不同），告知用户已有该因子并展示历史 `job_id`，询问是改参数重跑还是确认新建。
-- 若逻辑有实质区别（如 RSI 超卖 vs RSI 背离），正常继续。
+- If the new logic is **essentially identical** to a historical record (only params differ), tell the user the factor already exists, show the historical `job_id`, and ask whether to rerun with new params or proceed as new.
+- If the logic differs substantively (e.g. RSI oversold vs RSI divergence), continue normally.
 
-**0b. 提取任务信息**
+**0b. Extract Task Info**
 
-从用户描述中提取：
+From the user's description, extract:
 
-| 信息 | 说明 | 示例 |
+| Info | Description | Example |
 |------|------|------|
-| 因子逻辑 | 用自然语言描述信号如何产生 | "RSI低于30时做多" |
-| 核心参数 | 窗口期、阈值等超参 | `rsi_period=14, oversold=30` |
-| `factor_type` | 因子类型标识（snake_case，全局唯一） | `rsi_oversold_bounce` |
-| `factor_name` | 因子名称（含主要参数值） | `rsi_14_ob30` |
+| Factor logic | Describe in plain language how the signal is generated | "Long when RSI is below 30" |
+| Core params | Window, thresholds, etc. | `rsi_period=14, oversold=30` |
+| `factor_type` | Factor type identifier (snake_case, globally unique) | `rsi_oversold_bounce` |
+| `factor_name` | Factor name (includes major param values) | `rsi_14_ob30` |
 
-若用户描述不清晰，主动补问这几项，确认后再写代码。
+If the user's description is unclear, follow up on these items first; confirm before writing code.
 
 ---
 
-### 阶段 1：编写因子插件 plugin.py
+### Phase 1: Write the Factor Plugin plugin.py
 
-插件文件包含两部分，**必须同时实现，逻辑必须完全一致**：
+The plugin file contains two parts that **must both be implemented and have completely identical logic**:
 
-1. **`FACTOR_SECTIONS`**：C# 代码片段，服务器用它生成 `strategy.cs`
-2. **`build_signal()`**：Python 函数，服务器用它做超参网格搜索
+1. **`FACTOR_SECTIONS`**: C# code fragments — the server uses them to generate `strategy.cs`
+2. **`build_signal()`**: Python function — the server uses it for hyperparameter grid search
 
-#### 插件文件完整模板
+#### Plugin File — Full Template
 
 ```python
 import pandas as pd
 import numpy as np
 from typing import Any, Dict
 
-FACTOR_TYPE = "<factor_type>"   # 与提交时的 factor_type 参数保持一致
+FACTOR_TYPE = "<factor_type>"   # must match the factor_type passed at submission
 
 FACTOR_DEFAULT_PARAMS = {
-    "param1": <default_int>,    # 所有超参及默认值，key 用 snake_case
+    "param1": <default_int>,    # all hyperparams and their defaults; keys in snake_case
 }
 
 FACTOR_SECTIONS = {
-    # ── 注释类（人类可读） ───────────────────────────────────────────────
-    "__FACTOR_DESCRIPTION__": "因子的中文描述",
-    "__FACTOR_FORMULA__":     "信号公式（注释用）",
+    # ── Comment fields (human-readable) ─────────────────────────────────
+    "__FACTOR_DESCRIPTION__": "Factor description in English",
+    "__FACTOR_FORMULA__":     "Signal formula (used in comments)",
     "__FACTOR_TYPE__":        "<factor_type>",
 
-    # ── C# 类字段声明（每行末尾必须有 \n） ──────────────────────────────
+    # ── C# class field declarations (every line must end with \n) ───────
     "__FACTOR_PARAM_FIELDS__": (
         "        private int _param1;\n"
-        # 每个字段一行，注意 8 个空格缩进
+        # one field per line, note the 8-space indent
     ),
 
-    # ── C# 构造函数初始化（每行末尾必须有 \n） ───────────────────────────
+    # ── C# constructor init (every line must end with \n) ───────────────
     "__FACTOR_INIT__": (
         '            _param1 = GetIntParameter("param1", <default>);\n'
-        # key 用连字符（"param-one"），对应 Python 端 key 用下划线（"param_one"）
+        # keys use kebab-case ("param-one"); the corresponding Python key uses snake_case ("param_one")
     ),
 
-    # ── 初始化日志（每行末尾必须有 \n） ─────────────────────────────────
+    # ── Init log (every line must end with \n) ──────────────────────────
     "__FACTOR_LOG__": (
         '            Log($"[INIT] param1={_param1}");\n'
     ),
 
-    # ── 滑动窗口大小（合法 C# 整数表达式，不加引号） ─────────────────────
+    # ── Sliding window size (valid C# integer expression, no quotes) ────
     "__PRICE_WINDOW_EXPR__": "_param1 + 1",
 
-    # ── 额外数据列 Buffer 声明（每行末尾必须有 \n，仅用 close 时填 ""） ──
-    # FactorCsvBar 字段类型（决定 Enqueue 时是否需要强转）：
+    # ── Extra-column buffer declarations (line ends with \n; "" if only close is used) ──
+    # FactorCsvBar field types (determine whether casts are needed at Enqueue):
     #   decimal : Open / High / Low / Close / Volume
-    #             → Enqueue 时必须写 (double)bar.Volume 等，否则 CS1503 编译报错
+    #             → must write (double)bar.Volume etc. at Enqueue, otherwise CS1503 compile error
     #   double  : TakerBuyVolume / TakerSellVolume / TakerBuyQuoteVolume /
     #             TakerSellQuoteVolume / TakerBuyTrades / TakerSellTrades / QuoteVolume
-    #             → 直接 Enqueue，无需转型
-    "__EXTRA_BUF_FIELDS__": "",   # 示例：'        private readonly Queue<double> _volBuf = new Queue<double>();\n'
+    #             → Enqueue directly, no cast needed
+    "__EXTRA_BUF_FIELDS__": "",   # e.g. '        private readonly Queue<double> _volBuf = new Queue<double>();\n'
 
-    # ── 额外列每 bar 入队（每行末尾必须有 \n，不用时填 ""） ─────────────
-    # decimal 字段示例：'            _volBuf.Enqueue((double)bar.Volume);\n'
-    # double  字段示例：'            _takerBuyBuf.Enqueue(bar.TakerBuyVolume);\n'
+    # ── Per-bar enqueue for extra columns (line ends with \n; "" if unused) ──
+    # decimal field example: '            _volBuf.Enqueue((double)bar.Volume);\n'
+    # double  field example: '            _takerBuyBuf.Enqueue(bar.TakerBuyVolume);\n'
     "__EXTRA_BUF_ENQUEUE__": "",
 
-    # ── 额外列超窗口出队（每行末尾必须有 \n，不用时填 ""） ──────────────
-    "__EXTRA_BUF_DEQUEUE__": "",  # 示例：'            if (_volBuf.Count > requiredBars) _volBuf.Dequeue();\n'
+    # ── Dequeue when over window (line ends with \n; "" if unused) ───────
+    "__EXTRA_BUF_DEQUEUE__": "",  # e.g. '            if (_volBuf.Count > requiredBars) _volBuf.Dequeue();\n'
 
-    # ── 额外列转数组供计算体使用（每行末尾必须有 \n，不用时填 ""） ────────
-    "__EXTRA_BUF_TOARRAY__": "",  # 示例：'            var volumes = _volBuf.ToArray();\n'
+    # ── Convert extra columns to arrays for compute body (line ends with \n; "" if unused) ──
+    "__EXTRA_BUF_TOARRAY__": "",  # e.g. '            var volumes = _volBuf.ToArray();\n'
 
-    # ── C# 信号计算主体 ──────────────────────────────────────────────────
-    # 始终可用：prices[]（close，从旧到新）
-    # 若声明了 __EXTRA_BUF_TOARRAY__，对应数组也在此可用
-    # 必须给 rawSignal 赋值（正=看多，负=看空）并 return true
-    # 数据不足时 return false（不要 throw）
+    # ── C# signal compute body ──────────────────────────────────────────
+    # Always available: prices[] (close, oldest to newest)
+    # If __EXTRA_BUF_TOARRAY__ is declared, those arrays are also available here
+    # Must assign rawSignal (positive = long, negative = short) and return true
+    # Return false when data is insufficient (do not throw)
     "__FACTOR_COMPUTE_BODY__": """
-            // C# 计算逻辑
+            // C# compute logic
             var n = prices.Length;
             if (n < _param1) return false;
-            // ... 计算 ...
+            // ... compute ...
             rawSignal = <signal_value>;
             return true;
 """,
@@ -296,55 +297,55 @@ FACTOR_SECTIONS = {
 def build_signal(
     close: pd.DataFrame,
     params: Dict[str, Any],
-    # 声明因子用到的列（框架自动注入，与 close 地位相同）：
+    # Declare the columns this factor uses (the framework injects them, equal status to close):
     # open, high, low, volume,
     # taker_buy_volume, taker_sell_volume,
     # taker_buy_quote_volume, taker_sell_quote_volume,
     # taker_buy_trades, taker_sell_trades,
-    # quote_volume  ← 计算列，由 taker_buy_quote_volume + taker_sell_quote_volume 合成，原始 CSV/zip 无此列
+    # quote_volume  ← computed column, synthesized from taker_buy_quote_volume + taker_sell_quote_volume; no such raw CSV/zip column
     **_kwargs,
 ) -> pd.DataFrame:
     """
-    close  : pd.DataFrame，index=UTC DatetimeIndex，columns=币种代码
-    params : dict，key 与 FACTOR_DEFAULT_PARAMS 一致
-    返回   : 与 close 同形状的 DataFrame，正=看多，负=看空，NaN=无信号
-    逻辑必须与 FACTOR_SECTIONS.__FACTOR_COMPUTE_BODY__ 完全一致
+    close  : pd.DataFrame, index = UTC DatetimeIndex, columns = symbol codes
+    params : dict, keys aligned with FACTOR_DEFAULT_PARAMS
+    return : DataFrame of the same shape as close; positive = long, negative = short, NaN = no signal
+    Logic must be exactly identical to FACTOR_SECTIONS.__FACTOR_COMPUTE_BODY__
     """
     param1 = int(params.get("param1", <default>))
-    # ... Python 实现 ...
+    # ... Python implementation ...
     return signal.reindex_like(close)
 ```
 
-#### Python build_signal 约束（违反会导致 Step 4L 未来数据检测失败）
+#### Python build_signal Constraints (violations cause Step 4L future-data check to fail)
 
-| 约束 | 说明 |
+| Constraint | Reason |
 |------|------|
-| 禁止 `shift(-n)` | 负方向移位读取未来价格，最常见的泄露来源 |
-| 禁止 `pct_change(periods=-n)` | 负周期同上 |
-| 禁止 `fillna(method='bfill')` | backward fill 用未来值填补缺失 |
-| 禁止全局统计归一化 | `(x - x.mean()) / x.std()` 对整列计算，含未来数据 |
-| 禁止 `.rolling(n).mean().shift(-k)` | rolling 后再负移位 |
-| `shift` 参数必须为正整数 | `shift(1)` 向后看历史，是安全的 |
+| Forbid `shift(-n)` | Negative shift reads future prices — most common leakage source |
+| Forbid `pct_change(periods=-n)` | Negative period, same as above |
+| Forbid `fillna(method='bfill')` | Backward fill uses future values |
+| Forbid full-series stats normalization | `(x - x.mean()) / x.std()` over the whole column contains future data |
+| Forbid `.rolling(n).mean().shift(-k)` | Rolling then negative shift |
+| `shift` must use a positive integer | `shift(1)` looks back into history — safe |
 
-#### C# 代码约束（违反会导致 Step 4C 编译失败）
+#### C# Code Constraints (violations cause Step 4C compile failure)
 
-| 约束 | 说明 |
+| Constraint | Reason |
 |------|------|
-| `__PRICE_WINDOW_EXPR__` | 必须是纯 C# 整数表达式，不加引号，如 `_window + 1` |
-| `rawSignal` | 必须在 `__FACTOR_COMPUTE_BODY__` 中被赋值 |
-| 数据不足 | 用 `return false`，不要 `throw` 或 `return true` 而不赋值 |
-| 类型 | 所有计算用 `double`，不用 `decimal` 或 `float` |
-| 禁止调用 | `Securities[].GetLastData()`、`Portfolio`、`Order`、`SetHoldings` |
-| 参数 key | `GetIntParameter("param-name", default)` 用连字符 |
-| 每行末尾 | `__FACTOR_PARAM_FIELDS__` / `__FACTOR_INIT__` / `__FACTOR_LOG__` / `__EXTRA_BUF_FIELDS__` / `__EXTRA_BUF_ENQUEUE__` / `__EXTRA_BUF_DEQUEUE__` / `__EXTRA_BUF_TOARRAY__` 每行末尾加 `\n` |
-| 不用额外列时 | `__EXTRA_BUF_FIELDS__` / `__EXTRA_BUF_ENQUEUE__` / `__EXTRA_BUF_DEQUEUE__` / `__EXTRA_BUF_TOARRAY__` 填空字符串 `""` |
-| 额外列数组长度 | 额外列 buf 使用与 close 相同的 `requiredBars` 窗口大小 |
-| **decimal → double 强转** | `Open`/`High`/`Low`/`Close`/`Volume` 是 `decimal`，Enqueue 时必须写 `(double)bar.Volume` 否则报 `CS1503`；`TakerBuy*/TakerSell*/QuoteVolume` 已是 `double`，无需转型 |
+| `__PRICE_WINDOW_EXPR__` | Must be a pure C# integer expression, no quotes, e.g. `_window + 1` |
+| `rawSignal` | Must be assigned in `__FACTOR_COMPUTE_BODY__` |
+| Insufficient data | `return false`; do not `throw` or `return true` without assignment |
+| Types | Use `double` for all calculations; never `decimal` or `float` |
+| Forbidden API calls | `Securities[].GetLastData()`, `Portfolio`, `Order`, `SetHoldings` |
+| Parameter keys | `GetIntParameter("param-name", default)` uses kebab-case |
+| Line endings | `__FACTOR_PARAM_FIELDS__` / `__FACTOR_INIT__` / `__FACTOR_LOG__` / `__EXTRA_BUF_FIELDS__` / `__EXTRA_BUF_ENQUEUE__` / `__EXTRA_BUF_DEQUEUE__` / `__EXTRA_BUF_TOARRAY__` — every line ends with `\n` |
+| When no extra columns | `__EXTRA_BUF_FIELDS__` / `__EXTRA_BUF_ENQUEUE__` / `__EXTRA_BUF_DEQUEUE__` / `__EXTRA_BUF_TOARRAY__` are empty strings `""` |
+| Extra-column array length | Extra-column buffers use the same `requiredBars` window size as close |
+| **decimal → double cast** | `Open`/`High`/`Low`/`Close`/`Volume` are `decimal`; at Enqueue you must write `(double)bar.Volume` or you get `CS1503`. `TakerBuy*/TakerSell*/QuoteVolume` are already `double` — no cast needed |
 
-#### 参考实现（完整可运行的例子）
+#### Reference Implementations (full runnable examples)
 
 <details>
-<summary>示例：RSI 超卖反弹因子（rsi_oversold_bounce）</summary>
+<summary>Example: RSI Oversold-Bounce Factor (rsi_oversold_bounce)</summary>
 
 ```python
 import pandas as pd
@@ -360,7 +361,7 @@ FACTOR_DEFAULT_PARAMS = {
 }
 
 FACTOR_SECTIONS = {
-    "__FACTOR_DESCRIPTION__": "RSI 超卖反弹：RSI < oversold 做多，RSI > overbought 做空",
+    "__FACTOR_DESCRIPTION__": "RSI oversold bounce: long when RSI < oversold, short when RSI > overbought",
     "__FACTOR_FORMULA__":     "RSI < oversold → +(oversold-RSI)/oversold; RSI > overbought → -(RSI-overbought)/(100-overbought)",
     "__FACTOR_TYPE__":        "rsi_oversold_bounce",
     "__FACTOR_PARAM_FIELDS__": (
@@ -461,10 +462,10 @@ def build_signal(close: pd.DataFrame, params: Dict[str, Any], **_) -> pd.DataFra
 
 </details>
 
-插件写好后保存到一个临时路径供提交用，提交后再按 job_id 归档。
+Once the plugin is written, save it to a temporary path for submission, then archive it under the job_id after submitting.
 
 <details>
-<summary>示例：主力资金流入因子（taker_buy_ratio_momentum）— 使用 taker 额外列</summary>
+<summary>Example: Aggressive Money-Flow Factor (taker_buy_ratio_momentum) — uses taker extra columns</summary>
 
 ```python
 import pandas as pd
@@ -478,7 +479,7 @@ FACTOR_DEFAULT_PARAMS = {
 }
 
 FACTOR_SECTIONS = {
-    "__FACTOR_DESCRIPTION__": "主力资金流入：taker 主动买量占比的滚动均值偏离中性线 0.5",
+    "__FACTOR_DESCRIPTION__": "Aggressive money flow: rolling mean of taker active-buy share, deviation from neutral 0.5",
     "__FACTOR_FORMULA__":     "buy_ratio = taker_buy_vol / (buy+sell); signal = rolling_mean(buy_ratio, w) - 0.5",
     "__FACTOR_TYPE__":        "taker_buy_ratio_momentum",
     "__FACTOR_PARAM_FIELDS__": (
@@ -491,7 +492,7 @@ FACTOR_SECTIONS = {
         '            Log($"[INIT] window={_window}");\n'
     ),
     "__PRICE_WINDOW_EXPR__": "_window",
-    # ── 额外列：taker_buy_volume / taker_sell_volume ──────────────────
+    # ── Extra columns: taker_buy_volume / taker_sell_volume ─────────────
     "__EXTRA_BUF_FIELDS__": (
         "        private readonly Queue<double> _takerBuyBuf  = new Queue<double>();\n"
         "        private readonly Queue<double> _takerSellBuf = new Queue<double>();\n"
@@ -543,16 +544,16 @@ def build_signal(
 
 ---
 
-### 阶段 2：提交任务（双模式）
+### Phase 2: Submit Jobs (Dual Mode)
 
-每个因子**同时提交两个 job**——sigmoid_continuous 和 quantile_discrete：
+For every factor, **submit two jobs at once** — sigmoid_continuous and quantile_discrete:
 
 ```bash
-# 用进程唯一的临时路径，避免多 Agent 并发覆盖
+# Use a process-unique temp path so concurrent Agents don't overwrite each other
 PLUGIN_TMP="/tmp/plugin_${FACTOR_TYPE}_$$.py"
 
 cat > ${PLUGIN_TMP} << 'PLUGIN_EOF'
-<plugin 内容>
+<plugin content>
 PLUGIN_EOF
 
 # Job 1: sigmoid_continuous
@@ -560,7 +561,7 @@ curl -s -X POST ${BASE_URL}/jobs/submit \
   -F "factor_kind=custom" \
   -F "factor_type=<factor_type>" \
   -F "factor_name=<factor_name>" \
-  -F "params=<JSON字符串，如 {\"rsi_period\":14}>" \
+  -F "params=<JSON string, e.g. {\"rsi_period\":14}>" \
   -F "fwd_period=16" \
   -F "plugin=@${PLUGIN_TMP}"
 
@@ -569,14 +570,14 @@ curl -s -X POST ${BASE_URL}/jobs/submit \
   -F "factor_kind=custom" \
   -F "factor_type=<factor_type>" \
   -F "factor_name=<factor_name>" \
-  -F "params=<JSON字符串>" \
+  -F "params=<JSON string>" \
   -F "fwd_period=16" \
   -F "position_mode=quantile_discrete" \
   -F "entry_q=20" \
   -F "plugin=@${PLUGIN_TMP}"
 ```
 
-两次提交分别拿到 `job_id`，**设为两个 Shell 变量**：
+The two submissions return one `job_id` each; **save them as two shell variables**:
 
 ```bash
 JOB_ID_SIG="job_20260312_153001_xxxxxx"   # sigmoid_continuous
@@ -587,7 +588,7 @@ mkdir -p ./quant_agent/jobs/${JOB_ID_QD}
 cp ${PLUGIN_TMP} ./quant_agent/jobs/${JOB_ID_SIG}/plugin.py
 cp ${PLUGIN_TMP} ./quant_agent/jobs/${JOB_ID_QD}/plugin.py
 
-# 归档：SIG/QD 只写一条记录（job_id 使用 JOB_ID_SIG）
+# Archive: write only one record for SIG/QD (use JOB_ID_SIG as the job_id)
 REGISTRY=./quant_agent/factor_registry.jsonl
 [ -f "$REGISTRY" ] || : > "$REGISTRY"
 FORMULA_TEXT=$(awk -F'"' '/__FACTOR_FORMULA__/ {print $4; exit}' "./quant_agent/jobs/${JOB_ID_SIG}/plugin.py")
@@ -598,42 +599,42 @@ printf '{"factor_type":"%s","formula":"%s","job_id":"%s"}\n' \
 rm -f ${PLUGIN_TMP}
 ```
 
-> **builtin 因子**（`momentum` / `trend` / `mean_revert`）不需要上传 plugin，
-> 改用 `factor_kind=builtin` 并省略 `-F "plugin=..."` 即可（无需归档 plugin.py）。
+> **builtin factors** (`momentum` / `trend` / `mean_revert`) do not need a plugin upload —
+> use `factor_kind=builtin` and omit `-F "plugin=..."` (no plugin.py archiving needed).
 
 ---
 
-### 阶段 3：轮询等待（双 job 并行）
+### Phase 3: Poll and Wait (two jobs in parallel)
 
-每 **15 秒**同时查询两个 job 的状态，最多等待 **30 分钟**：
+Every **15 seconds**, query both jobs' status, with a max wait of **30 minutes**:
 
 ```bash
 curl -s ${BASE_URL}/jobs/${JOB_ID_SIG}/status
 curl -s ${BASE_URL}/jobs/${JOB_ID_QD}/status
 ```
 
-两个 job **独立处理**：一个完成不影响另一个的轮询，一个失败也不影响另一个。
+The two jobs are **handled independently**: one finishing does not affect the other's polling, and one failing does not affect the other.
 
-#### Agent 行为速查（对每个 job 独立判断）
+#### Agent Behavior Cheat Sheet (judge per job)
 
-| status | Agent 行为 |
+| status | Agent action |
 |--------|-----------|
-| `queued` / `running`（`current_step` < `"5"`） | 继续等待。每 2~3 次轮询告知用户当前进度 |
-| `running`（`current_step` >= `"5"`）或 `done` | **该 job 的 Step 4C 已完成**，标记为可下载 |
-| `failed`（`failed_step="4l"`） | Python 插件存在未来数据泄露，重写 `build_signal` 后提交**新 job**（禁止 retest）。两个 job 共用同一 plugin，需同时重新提交 |
-| `failed`（`failed_step="4c"`） | 进入**阶段 3b**修复该 job 的 C# |
-| `failed`（其他 step） | 告知用户该 job 服务器内部错误，无法修复 |
-| `retesting` | 继续等待 |
-| `retest_failed` | 查看 retest 日志，再次修复 strategy.cs |
+| `queued` / `running` (`current_step` < `"5"`) | Keep waiting. Every 2–3 polls, report progress to user |
+| `running` (`current_step` >= `"5"`) or `done` | **This job's Step 4C is done**, mark as ready to download |
+| `failed` (`failed_step="4l"`) | Python plugin has future-data leakage; rewrite `build_signal` and submit **a new job** (retest forbidden). Both jobs share the same plugin and must be resubmitted together |
+| `failed` (`failed_step="4c"`) | Go to **phase 3b** to fix this job's C# |
+| `failed` (other steps) | Tell the user this job hit a server-internal error and cannot be fixed |
+| `retesting` | Keep waiting |
+| `retest_failed` | Inspect retest logs and fix strategy.cs again |
 
-> **关键规则**：**两个 job 都** `current_step >= 5` 后才进入阶段 4。若其中一个先完成，继续等另一个；若一个彻底失败（非 C# 编译问题），仍用另一个已完成的结果进入阶段 4，向用户说明哪个模式失败了。
+> **Key rule**: only enter phase 4 once **both jobs** have `current_step >= 5`. If one finishes first, keep waiting on the other; if one fully fails (non-C#-compile), still proceed to phase 4 with the surviving result and tell the user which mode failed.
 
-#### strategy_cs_ready 标志
+#### strategy_cs_ready Flag
 
-轮询时若某个 job 返回 `"strategy_cs_ready": true`，立即下载并归档该 job 的 strategy.cs（只需一次）：
+If a job's status returns `"strategy_cs_ready": true`, immediately download and archive that job's strategy.cs (one-time):
 
 ```bash
-# 对 JOB_ID_SIG 和 JOB_ID_QD 分别执行（哪个 ready 就下载哪个）
+# Run for JOB_ID_SIG and JOB_ID_QD separately (download whichever is ready)
 mkdir -p ./quant_agent/jobs/${JOB_ID_SIG}
 curl -s ${BASE_URL}/jobs/${JOB_ID_SIG}/files/strategy.cs \
   -o ./quant_agent/jobs/${JOB_ID_SIG}/strategy.cs
@@ -645,61 +646,61 @@ curl -s ${BASE_URL}/jobs/${JOB_ID_QD}/files/strategy.cs \
 
 ---
 
-### 阶段 3b：修复 C# 编译错误并 retest
+### Phase 3b: Fix C# Compile Errors and Retest
 
-当某个 job `status=failed` 且 `failed_step` 为 `"4c"` 时，对**该 job** 执行修复。
-两个 job 的 C# 模板不同（sigmoid vs quantile），需分别修复。
-以下用 `${JOB_ID}` 代指出错的那个 job_id。
+When a job has `status=failed` and `failed_step="4c"`, fix **that job**.
+The two jobs use different C# templates (sigmoid vs quantile) — fix them separately.
+Below, `${JOB_ID}` refers to the failing job_id.
 
-**1. 查看错误日志**
+**1. Inspect error logs**
 
 ```bash
 curl -s "${BASE_URL}/jobs/${JOB_ID}/logs?tail=80"
 ```
 
-**2. 下载并修复 strategy.cs**
+**2. Download and fix strategy.cs**
 
 ```bash
 curl -s ${BASE_URL}/jobs/${JOB_ID}/files/strategy.cs \
   -o ./quant_agent/jobs/${JOB_ID}/strategy.cs
 ```
 
-根据日志中的错误信息修改。常见错误速查表：
+Fix according to the log error info. Common error reference:
 
-| 错误信息 | 原因 | 修复方式 |
+| Error | Cause | Fix |
 |---------|------|---------|
-| `CS0019: Operator '/' cannot be applied to 'double' and 'decimal'` | C# 类型不匹配 | 在除法前加 `(double)` 强转 |
-| `CS0103: The name 'xxx' does not exist` | 变量名拼写错误或作用域不对 | 检查 `__FACTOR_PARAM_FIELDS__` 中的声明 |
-| `CS0128: A local variable named 'xxx' is already defined` | 变量名与模板框架冲突 | 在 `__FACTOR_COMPUTE_BODY__` 中重命名变量（**不要动框架代码**） |
-| `CS1002: ; expected` | C# 语法错误 | 检查 `__FACTOR_COMPUTE_BODY__` 的每行结尾 |
-| `rawSignal` 始终为 0 | `return true` 前忘记给 `rawSignal` 赋值 | 确保所有代码路径都给 `rawSignal` 赋值 |
-| 回测运行时 NullReference | 访问了未初始化的字段 | 检查 `__FACTOR_INIT__` 是否遗漏了某个字段初始化 |
+| `CS0019: Operator '/' cannot be applied to 'double' and 'decimal'` | C# type mismatch | Add `(double)` cast before division |
+| `CS0103: The name 'xxx' does not exist` | Variable name typo or wrong scope | Check declaration in `__FACTOR_PARAM_FIELDS__` |
+| `CS0128: A local variable named 'xxx' is already defined` | Variable name conflicts with template framework | Rename in `__FACTOR_COMPUTE_BODY__` (**do not touch framework code**) |
+| `CS1002: ; expected` | C# syntax error | Check end of every line in `__FACTOR_COMPUTE_BODY__` |
+| `rawSignal` always 0 | Forgot to assign `rawSignal` before `return true` | Assign `rawSignal` on every code path |
+| Runtime NullReference during backtest | Accessed an uninitialized field | Check whether `__FACTOR_INIT__` missed initializing some field |
 
-**修复原则**：只修改 `#region FactorComputeBody` 区域内的代码，不要动框架代码。
+**Fix principle**: only modify code inside `#region FactorComputeBody`; do not touch framework code.
 
-**3. 提交 retest**
+**3. Submit retest**
 
 ```bash
 curl -s -X POST ${BASE_URL}/jobs/${JOB_ID}/retest \
   -F "strategy_cs=@./quant_agent/jobs/${JOB_ID}/strategy.cs"
 ```
 
-返回 `{ "status": "retesting" }` 后回到**阶段 3**继续轮询。retest 提交后，服务器自动从失败点恢复并跑完所有后续步骤。
+After receiving `{ "status": "retesting" }`, return to **phase 3** and continue polling. Once retest is submitted, the server resumes from the failure point and runs all subsequent steps automatically.
 
-> 若连续 3 次 retest 仍失败，考虑重写 plugin.py 后重新 POST `/jobs/submit` 开新任务。
+> If retest fails 3 times in a row, consider rewriting plugin.py and POST `/jobs/submit` again to start a fresh job.
 
 ---
 
-### 阶段 4：获取结果、对比展示、开始下一个因子
+### Phase 4: Fetch Results, Compare, and Move to Next Factor
 
-> **⚠️ 关键规则**：两个 job 的 `current_step >= 5` 时 Step 4C 已完成，**直接下载文件**。
-> **禁止调用 `/result` 接口**——该接口需要整个 pipeline（Step 16D）跑完才返回数据，
-> 而用户只需要看 Step 4C 的默认参数回测结果，不需要等后续步骤。
+> **⚠️ Key rule**: when both jobs reach `current_step >= 5`, Step 4C is done — **download files directly**.
+> **Do not call the `/result` endpoint** — that endpoint requires the entire pipeline (Step 16D) to finish before returning data,
+> while the user only needs to see the Step 4C default-parameter backtest, not later steps.
 
-#### 4a. 下载产物文件（对两个 job 分别执行）
+#### 4a. Download Artifacts (run for both jobs)
 
 ```bash
-# 对 JOB_ID_SIG 和 JOB_ID_QD 分别下载（以下用 JOB_ID 代指）
+# Run for JOB_ID_SIG and JOB_ID_QD separately (JOB_ID below stands in for either)
 for JOB_ID in ${JOB_ID_SIG} ${JOB_ID_QD}; do
   JOB_DIR=./quant_agent/jobs/${JOB_ID}
   mkdir -p ${JOB_DIR}/step4c
@@ -727,159 +728,159 @@ for JOB_ID in ${JOB_ID_SIG} ${JOB_ID_QD}; do
 done
 ```
 
-> 若文件尚未生成（旧 job 或 Step 12 尚未完成），curl 会收到 404，忽略即可。
+> If a file is not yet generated (old job, or Step 12 not yet done), curl returns 404; ignore.
 
-#### 4b. 读取两份 factor_card_default.json 并对比展示
+#### 4b. Read Both factor_card_default.json Files and Present a Side-by-Side Comparison
 
-分别读取 SIG 和 QD 的 `factor_card_default.json`，提取关键指标做**对比表格**。  
-**必须同时汇报 `ts_success`、`cs_success`、`status`（Overall = TS OR CS）**，不要只报单一 pass/fail。
+Read SIG's and QD's `factor_card_default.json` separately, extract the key metrics, build a **comparison table**.
+**You must report `ts_success`, `cs_success`, and `status` (Overall = TS OR CS) together** — never report only a single pass/fail.
 
-**Sigmoid Continuous（SIG job）关注字段：**
+**Sigmoid Continuous (SIG job) — fields to focus on:**
 
-| JSON 字段 | 用途 |
+| JSON field | Purpose |
 |-----------|------|
-| `ts_success` | TS 是否成功（`true/false`） |
-| `cs_success` | CS 是否成功（`true/false`） |
-| `status` | Overall（`pass/fail`，规则为 TS OR CS） |
-| `ts_fail_reasons` | TS 失败原因列表（若有） |
-| `cs_fail_reasons` | CS 失败原因列表（若有） |
-| `median_sharpe` | 默认参数中位 Sharpe |
-| `icir` | IC 信息比率 |
-| `median_annual_return` | 中位年化收益 |
-| `median_max_drawdown` | 中位最大回撤 |
-| `win_rate` | 胜率 |
-| `rank_icir` | RankICIR（截面预测力） |
-| `cs_branch.profile.monotonicity_score` | 分组单调性打分（若有） |
+| `ts_success` | Whether TS succeeded (`true/false`) |
+| `cs_success` | Whether CS succeeded (`true/false`) |
+| `status` | Overall (`pass/fail`, rule = TS OR CS) |
+| `ts_fail_reasons` | TS failure reason list (if any) |
+| `cs_fail_reasons` | CS failure reason list (if any) |
+| `median_sharpe` | Default-param median Sharpe |
+| `icir` | IC information ratio |
+| `median_annual_return` | Median annualized return |
+| `median_max_drawdown` | Median max drawdown |
+| `win_rate` | Win rate |
+| `rank_icir` | RankICIR (cross-section predictive power) |
+| `cs_branch.profile.monotonicity_score` | Group monotonicity score (if any) |
 
-**Quantile Discrete（QD job）关注字段：**
+**Quantile Discrete (QD job) — fields to focus on:**
 
-| JSON 字段 | 含义 |
+| JSON field | Meaning |
 |-----------|------|
-| `ts_success` | TS 是否成功（`true/false`） |
-| `cs_success` | CS 是否成功（`true/false`） |
-| `status` | Overall（`pass/fail`，规则为 TS OR CS） |
-| `ts_fail_reasons` | TS 失败原因列表（若有） |
-| `cs_fail_reasons` | CS 失败原因列表（若有） |
-| `median_sharpe` | C# 回测 Sharpe（信号质量参考） |
-| `ts_branch.discrete_turnover` | 离散状态切换频率（每 bar） |
-| `ts_branch.median_hold_bars` | 中位持有时长（bar 数） |
-| `ts_branch.metrics_pool.sharpe_pool` | 组合级 Sharpe（全币池聚合） |
-| `ts_branch.metrics_pool.max_dd_pool` | 组合级最大回撤 |
-| `rank_icir` | RankICIR（截面预测力） |
-| `direction_stability` | 滚动 IC 同号占比（0~1） |
+| `ts_success` | Whether TS succeeded (`true/false`) |
+| `cs_success` | Whether CS succeeded (`true/false`) |
+| `status` | Overall (`pass/fail`, rule = TS OR CS) |
+| `ts_fail_reasons` | TS failure reason list (if any) |
+| `cs_fail_reasons` | CS failure reason list (if any) |
+| `median_sharpe` | C# backtest Sharpe (signal-quality reference) |
+| `ts_branch.discrete_turnover` | Discrete state-switching frequency (per bar) |
+| `ts_branch.median_hold_bars` | Median hold duration (in bars) |
+| `ts_branch.metrics_pool.sharpe_pool` | Portfolio-level Sharpe (aggregated across symbols) |
+| `ts_branch.metrics_pool.max_dd_pool` | Portfolio-level max drawdown |
+| `rank_icir` | RankICIR (cross-section predictive power) |
+| `direction_stability` | Rolling IC same-sign ratio (0–1) |
 
-> **重要**：QD job 的主要结果来自 Python 侧 Step 8/10 的离散仓位模拟；
-> C# Lean 云端回测（Step 4C）的 `median_sharpe` 口径是 Sigmoid，仅作**信号质量参考**。
+> **Important**: the QD job's primary results come from the Python-side discrete-position simulation in Step 8/10;
+> the C# Lean cloud backtest (Step 4C)'s `median_sharpe` is computed under the Sigmoid convention and serves as a **signal-quality reference only**.
 
-同时展示**两个 job 的图表**：
-- `equity_curves.png`：TS 时序策略权益曲线（SIG + QD 各一张）
-- `ts_profile_4panel.png`：TS 4合1时序画像图——IC 均值/胜率/Sharpe 分布/回撤分布（SIG + QD 各一张，**必须展示**）
-- `group_return_plot.png`：CS 截面分组累计收益（两个 job 共用同一份 CS 数据，展示其中一张即可）
-- `cs_profile_4panel.png`：CS 4 合 1 截面评价图（两个 job 共用同一份 CS 数据，展示其中一张即可）
-- `cs_nav_curves.png`：CS 净值曲线图——纯多头/纯空头/多空（两个 job 共用，展示其中一张即可）
+Also present **both jobs' charts**:
+- `equity_curves.png`: TS time-series strategy equity curve (one for SIG, one for QD)
+- `ts_profile_4panel.png`: TS 4-in-1 time-series profile — IC mean / win rate / Sharpe distribution / drawdown distribution (one for SIG, one for QD; **must be shown**)
+- `group_return_plot.png`: CS cross-section grouped cumulative return (both jobs share the same CS data; show one is enough)
+- `cs_profile_4panel.png`: CS 4-in-1 cross-section evaluation chart (both jobs share the same CS data; show one is enough)
+- `cs_nav_curves.png`: CS NAV curves — long-only / short-only / long-short (both jobs share; show one is enough)
 
-#### 4c. 对比总结并进入下一轮
+#### 4c. Comparison Summary and Move to Next Round
 
-用**对比表格 + 一段话**总结两种模式的核心表现：
+Use a **comparison table + a short summary** to summarize the core performance of the two modes:
 
 ```
-| 指标             | Sigmoid Continuous | Quantile Discrete |
-|------------------|--------------------|-------------------|
-| TS Success       | true / false       | true / false      |
-| CS Success       | true / false       | true / false      |
-| Overall (TS OR CS) | pass / fail      | pass / fail       |
-| Median Sharpe    | x.xx               | x.xx (信号参考)    |
-| QD Sharpe Pool   | -                  | x.xx              |
-| Rank ICIR        | x.xx               | x.xx              |
-| Win Rate         | xx%                | -                 |
-| Monotonicity     | x.xx               | x.xx              |
-| Hold Bars (QD)   | -                  | xx                |
-| Turnover (QD)    | -                  | x.xxxx            |
-| Dir Stability    | x.xx               | x.xx              |
+| Metric             | Sigmoid Continuous | Quantile Discrete |
+|--------------------|--------------------|-------------------|
+| TS Success         | true / false       | true / false      |
+| CS Success         | true / false       | true / false      |
+| Overall (TS OR CS) | pass / fail        | pass / fail       |
+| Median Sharpe      | x.xx               | x.xx (signal ref.)|
+| QD Sharpe Pool     | -                  | x.xx              |
+| Rank ICIR          | x.xx               | x.xx              |
+| Win Rate           | xx%                | -                 |
+| Monotonicity       | x.xx               | x.xx              |
+| Hold Bars (QD)     | -                  | xx                |
+| Turnover (QD)      | -                  | x.xxxx            |
+| Dir Stability      | x.xx               | x.xx              |
 ```
 
-总结要点：
-- 哪种模式表现更好、各自优劣
-- 必须分别解释 TS 是否成功、CS 是否成功，以及 Overall 为什么是当前结果
-- 如果某个模式 Overall fail，分析失败维度（TS/CS）并给出改进方向
-- 重点说明 `rank_icir` 和 `direction_stability` 是否支持进入因子库
+Summary must include:
+- Which mode performed better, plus relative pros and cons
+- Explicitly explain whether TS succeeded, whether CS succeeded, and why Overall is the current value
+- If a mode's Overall fails, identify the failure dimension (TS / CS) and give an improvement direction
+- Highlight whether `rank_icir` and `direction_stability` support admission to the factor library
 
-**展示完结果后：**
+**After presenting results:**
 
-- **WORK_MODE = A 或 B**：直接与用户讨论下一个因子，这个因子的全部工作已经结束。
+- **WORK_MODE = A or B**: discuss the next factor with the user directly — this factor's full work is finished.
 
 ---
 
-## 完整流程示意图
+## Full Workflow Diagram
 
 ```
-用户：「研究一个布林带宽度突破因子」
+User: "Research a Bollinger band-width breakout factor"
         │
         ▼
-[阶段-1] 选择工作模式
-         A：打工模式
-         B：自由定义
+[Phase -1] Choose work mode
+           A: Auto-Discovery Mode
+           B: Free Mode
         │
         ▼
-[阶段0] 确认 factor_type / factor_name / params
+[Phase 0] Confirm factor_type / factor_name / params
         │
         ▼
-[阶段1] 写 plugin.py（C# 片段 + Python build_signal）
+[Phase 1] Write plugin.py (C# fragments + Python build_signal)
         │
         ▼
-[阶段2] POST /jobs/submit × 2（sigmoid + quantile）→ 拿到 JOB_ID_SIG + JOB_ID_QD
+[Phase 2] POST /jobs/submit × 2 (sigmoid + quantile) → JOB_ID_SIG + JOB_ID_QD
         │
         ▼
-[阶段3] 并行轮询两个 job，等待 Step 4C 完成（current_step >= 5 或 done）
+[Phase 3] Poll both jobs in parallel; wait for Step 4C done (current_step >= 5 or done)
         │
-        ├─ strategy_cs_ready=true → 下载对应 job 的 strategy.cs
-        ├─ failed (4c) → [阶段3b] 修该 job 的 C# → retest → 回到轮询
+        ├─ strategy_cs_ready=true → download that job's strategy.cs
+        ├─ failed (4c) → [Phase 3b] fix that job's C# → retest → back to polling
         │
-        └─ 两个 job 都 current_step >= 5 或 done（或一个彻底失败）
+        └─ Both jobs at current_step >= 5 or done (or one fully failed)
              │
              ▼
-[阶段4] 下载两个 job 的 default_ 文件（含新增 ts_profile_4panel.png）
-        → 对比展示因子卡片 + TS 4合1画像图
-        → 讨论下一个因子
-（Step 5–16 服务端异步运行，用户侧流程到此完全结束）
+[Phase 4] Download both jobs' default_ files (incl. new ts_profile_4panel.png)
+        → Compare and present factor cards + TS 4-in-1 profile
+        → Discuss next factor
+(Steps 5–16 run async on the server; the user-facing flow ends here)
 ```
 
 ---
 
-## 其他接口
+## Other Endpoints
 
 ```bash
-# 查看 retest 日志
+# View retest logs
 curl -s "${BASE_URL}/jobs/${JOB_ID}/retest_logs?tail=100"
 
-# 健康检查
+# Health check
 curl -s ${BASE_URL}/health
 ```
 
 ---
 
-## 向用户汇报进度的节奏
+## Cadence for Reporting Progress to the User
 
-- 提交成功后立即告知两个任务编号（标注「连续模式」/「梯度模式」，不用解释技术含义）
-- 每 2~3 次等待间隔告知用户两个任务的当前情况（不必每次都说）
-- 看到 `current_step="4c"` 时说时说「正在跑回测，约需 3~5 分钟」
-- 遇到 C# 编译失败（仅 Step 4C）时告知用户「正在修复代码后重试」，不要抛出错误
-- **两个 job 都 `current_step` >= 5 后，立即停止轮询，获取结果**
-- 结果出来后用对比表格展示两种模式，重点突出「时序测试是否通过」「截面测试是否通过」「综合结论」、Sharpe、ICIR
-- **只展示默认参数版结果**，展示完直接进入下一个因子
+- Immediately after submission, report both job IDs (label them as "continuous mode" / "quantile mode" — do not explain the technical meaning)
+- Every 2–3 poll intervals, tell the user the current state of both jobs (no need to update on every poll)
+- When `current_step="4c"`, say "running backtest, takes ~3–5 minutes"
+- On C# compile failure (Step 4C only), say "fixing the code and retrying" — do not throw an error
+- **Once both jobs reach `current_step >= 5`, stop polling immediately and fetch results**
+- After results are ready, use a comparison table to show both modes; emphasize "did the time-series test pass", "did the cross-section test pass", "overall conclusion", Sharpe, ICIR
+- **Show only the default-parameter results**; after presenting, move directly to the next factor
 
-### ⛔ 措辞禁忌（对用户说话时绝对不出现）
+### ⛔ Forbidden Wording (must not appear when speaking to the user)
 
-以下是内部术语，只能出现在 Agent 的处理逻辑里，**不能直接说给用户听**：
+The following are internal terms — they only live in the Agent's processing logic and **must not be spoken to the user**:
 
-| 禁止说的词 | 可以替换成 |
+| Forbidden term | Replace with |
 |-----------|-----------|
-| `Step 4C` / `current_step` / `Step 4L` | 「回测阶段」/ 「检测阶段」 |
-| `strategy_cs_ready` | 不需要跟用户提 |
-| `sigmoid_continuous` | 「连续模式」，或直接略去不解释 |
-| `quantile_discrete` | 「梯度模式」，或直接略去不解释 |
-| `SIG job` / `QD job` | 「连续模式任务」/「梯度模式任务」 |
-| `C# 编译失败` | 「策略代码遇到了小问题」 |
-| `retest` / `轮询` | 「重新测试」/ 「等待结果」 |
-| `plugin.py` / `build_signal` / `FACTOR_SECTIONS` | 不需要跟用户提 |
-| `ts_success` / `cs_success` / `rank_icir` 等字段名 | 用中文说意思，如「时序测试通过」「截面预测力」 |
+| `Step 4C` / `current_step` / `Step 4L` | "backtest stage" / "detection stage" |
+| `strategy_cs_ready` | Don't mention to the user |
+| `sigmoid_continuous` | "continuous mode", or omit and don't explain |
+| `quantile_discrete` | "quantile mode", or omit and don't explain |
+| `SIG job` / `QD job` | "continuous-mode task" / "quantile-mode task" |
+| `C# compile failed` | "the strategy code hit a small issue" |
+| `retest` / `polling` | "retest" / "waiting for results" |
+| `plugin.py` / `build_signal` / `FACTOR_SECTIONS` | Don't mention to the user |
+| `ts_success` / `cs_success` / `rank_icir` and other field names | Use plain English meaning, e.g. "time-series test passed" / "cross-section predictive power" |
