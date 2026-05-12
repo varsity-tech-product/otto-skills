@@ -13,7 +13,7 @@ description: >
 ## Service Endpoint
 
 ```
-BASE_URL = http://54.151.204.72:8000
+BASE_URL = http://quantai-alb-396163355.ap-southeast-1.elb.amazonaws.com
 ```
 
 > Before starting, run `curl ${BASE_URL}/health` to confirm the service is online. If the connection fails, notify the user immediately.
@@ -634,14 +634,12 @@ The two jobs are **handled independently**: one finishing does not affect the ot
 If a job's status returns `"strategy_cs_ready": true`, immediately download and archive that job's strategy.cs (one-time):
 
 ```bash
-# Run for JOB_ID_SIG and JOB_ID_QD separately (download whichever is ready)
+# Use the fetch_artifact helper from phase 4 (handles EFS→S3 fallback automatically)
 mkdir -p ./quant_agent/jobs/${JOB_ID_SIG}
-curl -s ${BASE_URL}/jobs/${JOB_ID_SIG}/files/strategy.cs \
-  -o ./quant_agent/jobs/${JOB_ID_SIG}/strategy.cs
+fetch_artifact ${JOB_ID_SIG} strategy.cs ./quant_agent/jobs/${JOB_ID_SIG}/strategy.cs
 
 mkdir -p ./quant_agent/jobs/${JOB_ID_QD}
-curl -s ${BASE_URL}/jobs/${JOB_ID_QD}/files/strategy.cs \
-  -o ./quant_agent/jobs/${JOB_ID_QD}/strategy.cs
+fetch_artifact ${JOB_ID_QD} strategy.cs ./quant_agent/jobs/${JOB_ID_QD}/strategy.cs
 ```
 
 ---
@@ -699,36 +697,51 @@ After receiving `{ "status": "retesting" }`, return to **phase 3** and continue 
 
 #### 4a. Download Artifacts (run for both jobs)
 
+> **Note**: the server runs a daily EFS cleanup (max_age=1 day). For older jobs the
+> EFS-side artifact may already be deleted, but the S3 archive remains. Use the
+> `fetch_artifact` helper below: it tries the default `as=file` path first, and on
+> 404 transparently falls back to `?as=url` to download from S3 via presigned URL.
+
 ```bash
+# Helper: try EFS first, fall back to S3 presigned URL on 404
+fetch_artifact() {
+  local job_id="$1" name="$2" out="$3"
+  local code
+  code=$(curl -s -o "${out}" -w "%{http_code}" \
+           "${BASE_URL}/jobs/${job_id}/files/${name}")
+  if [ "${code}" = "200" ]; then return 0; fi
+  if [ "${code}" = "404" ]; then
+    # Fall back to S3 presigned URL (EFS may have been cleaned)
+    local url
+    url=$(curl -s "${BASE_URL}/jobs/${job_id}/files/${name}?as=url" \
+           | python3 -c "import sys,json; print(json.load(sys.stdin).get('url',''))")
+    if [ -n "${url}" ]; then
+      code=$(curl -sL -o "${out}" -w "%{http_code}" "${url}")
+      [ "${code}" = "200" ] && return 0
+    fi
+  fi
+  rm -f "${out}"   # don't leave empty/partial files behind
+  echo "skip ${name} (http=${code})"
+  return 1
+}
+
 # Run for JOB_ID_SIG and JOB_ID_QD separately (JOB_ID below stands in for either)
 for JOB_ID in ${JOB_ID_SIG} ${JOB_ID_QD}; do
   JOB_DIR=./quant_agent/jobs/${JOB_ID}
   mkdir -p ${JOB_DIR}/step4c
 
-  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_factor_card.json \
-    -o ${JOB_DIR}/factor_card_default.json
-
-  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_equity_curves.png \
-    -o ${JOB_DIR}/step4c/equity_curves.png
-
-  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_ts_profile_4panel.png \
-    -o ${JOB_DIR}/step4c/ts_profile_4panel.png
-
-  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_trade_log.csv \
-    -o ${JOB_DIR}/step4c/trade_log.csv
-
-  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_group_return_plot.png \
-    -o ${JOB_DIR}/step4c/group_return_plot.png
-
-  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_cs_profile_4panel.png \
-    -o ${JOB_DIR}/step4c/cs_profile_4panel.png
-
-  curl -s ${BASE_URL}/jobs/${JOB_ID}/files/default_cs_nav_curves.png \
-    -o ${JOB_DIR}/step4c/cs_nav_curves.png
+  fetch_artifact ${JOB_ID} default_factor_card.json      ${JOB_DIR}/factor_card_default.json
+  fetch_artifact ${JOB_ID} default_equity_curves.png     ${JOB_DIR}/step4c/equity_curves.png
+  fetch_artifact ${JOB_ID} default_ts_profile_4panel.png ${JOB_DIR}/step4c/ts_profile_4panel.png
+  fetch_artifact ${JOB_ID} default_trade_log.csv         ${JOB_DIR}/step4c/trade_log.csv
+  fetch_artifact ${JOB_ID} default_group_return_plot.png ${JOB_DIR}/step4c/group_return_plot.png
+  fetch_artifact ${JOB_ID} default_cs_profile_4panel.png ${JOB_DIR}/step4c/cs_profile_4panel.png
+  fetch_artifact ${JOB_ID} default_cs_nav_curves.png     ${JOB_DIR}/step4c/cs_nav_curves.png
 done
 ```
 
-> If a file is not yet generated (old job, or Step 12 not yet done), curl returns 404; ignore.
+> If a file is not yet generated (old job, or Step 12 not yet done), both paths return 404; ignore.
+> If a file is missing only on EFS (cleaned up), the fallback transparently fetches it from S3.
 
 #### 4b. Read Both factor_card_default.json Files and Present a Side-by-Side Comparison
 
