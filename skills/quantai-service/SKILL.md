@@ -43,6 +43,7 @@ Record these paths into working variables at the start of each new task:
         ├── plugin.py                  ← uploaded factor plugin (saved after phase 2)
         ├── strategy.cs                ← C# strategy from Step 4a (download when strategy_cs_ready=true)
         ├── factor_card_default.json   ← Step 4C default-parameter factor card (download after Step 4C)
+        ├── factor_card_default.txt    ← human-readable txt version of the same card (optional)
         └── step4c/
             ├── equity_curves.png      ← Step 4C default-parameter equity curve
             ├── ts_profile_4panel.png  ← TS 4-in-1 time-series profile (new)
@@ -731,6 +732,7 @@ for JOB_ID in ${JOB_ID_SIG} ${JOB_ID_QD}; do
   mkdir -p ${JOB_DIR}/step4c
 
   fetch_artifact ${JOB_ID} default_factor_card.json      ${JOB_DIR}/factor_card_default.json
+  fetch_artifact ${JOB_ID} default_factor_card.txt       ${JOB_DIR}/factor_card_default.txt
   fetch_artifact ${JOB_ID} default_equity_curves.png     ${JOB_DIR}/step4c/equity_curves.png
   fetch_artifact ${JOB_ID} default_ts_profile_4panel.png ${JOB_DIR}/step4c/ts_profile_4panel.png
   fetch_artifact ${JOB_ID} default_trade_log.csv         ${JOB_DIR}/step4c/trade_log.csv
