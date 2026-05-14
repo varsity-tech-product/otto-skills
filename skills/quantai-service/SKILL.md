@@ -263,9 +263,22 @@ FACTOR_SECTIONS = {
     # FactorCsvBar field types (determine whether casts are needed at Enqueue):
     #   decimal : Open / High / Low / Close / Volume
     #             → must write (double)bar.Volume etc. at Enqueue, otherwise CS1503 compile error
-    #   double  : TakerBuyVolume / TakerSellVolume / TakerBuyQuoteVolume /
-    #             TakerSellQuoteVolume / TakerBuyTrades / TakerSellTrades / QuoteVolume
-    #             → Enqueue directly, no cast needed
+    #   double  (base): TakerBuyVolume / TakerSellVolume / TakerBuyQuoteVolume /
+    #                  TakerSellQuoteVolume / TakerBuyTrades / TakerSellTrades / QuoteVolume
+    #   double  (extra futures / on-chain columns):
+    #     OpenInterestOpen / OpenInterestHigh / OpenInterestLow / OpenInterestClose
+    #     FundingRateOpen / FundingRateHigh / FundingRateLow / FundingRateClose
+    #     GlobalAccountLongPercent / GlobalAccountShortPercent / GlobalAccountLongShortRatio
+    #     TopPositionLongPercent / TopPositionShortPercent / TopPositionLongShortRatio
+    #     TopAccountLongPercent / TopAccountShortPercent / TopAccountLongShortRatio
+    #     LiquidationLongUsd / LiquidationShortUsd
+    #     BinancePremiumIndexOpen / BinancePremiumIndexHigh / BinancePremiumIndexLow / BinancePremiumIndexClose
+    #     → All double, Enqueue directly, no cast needed.
+    #     → Older coins / early dates may be NaN (structural data gaps).
+    #       The strategy template auto-injects a NaN scan over every array
+    #       declared in __EXTRA_BUF_TOARRAY__ before your compute body runs,
+    #       so a NaN value transparently causes the symbol to skip that day.
+    #       You do NOT need to write `if (double.IsNaN(x)) return false;` yourself.
     "__EXTRA_BUF_FIELDS__": "",   # e.g. '        private readonly Queue<double> _volBuf = new Queue<double>();\n'
 
     # ── Per-bar enqueue for extra columns (line ends with \n; "" if unused) ──
@@ -299,11 +312,23 @@ def build_signal(
     close: pd.DataFrame,
     params: Dict[str, Any],
     # Declare the columns this factor uses (the framework injects them, equal status to close):
+    # ── base kline (11) ──
     # open, high, low, volume,
     # taker_buy_volume, taker_sell_volume,
     # taker_buy_quote_volume, taker_sell_quote_volume,
     # taker_buy_trades, taker_sell_trades,
-    # quote_volume  ← computed column, synthesized from taker_buy_quote_volume + taker_sell_quote_volume; no such raw CSV/zip column
+    # quote_volume  ← computed column = taker_buy_quote_volume + taker_sell_quote_volume
+    # ── futures / on-chain (23) ──
+    # open_interest_open / open_interest_high / open_interest_low / open_interest_close
+    # funding_rate_open / funding_rate_high / funding_rate_low / funding_rate_close
+    # global_account_long_percent / global_account_short_percent / global_account_long_short_ratio
+    # top_position_long_percent / top_position_short_percent / top_position_long_short_ratio
+    # top_account_long_percent / top_account_short_percent / top_account_long_short_ratio
+    # liquidation_long_usd / liquidation_short_usd
+    # binance_premium_index_open / binance_premium_index_high / binance_premium_index_low / binance_premium_index_close
+    # NOTE: older coins / early dates can be NaN. rolling/sum auto-skips NaN,
+    #       but for cross-section ops (mean, std, rank) call .dropna() / .notna() first
+    #       so a few NaN cells don't contaminate the whole column.
     **_kwargs,
 ) -> pd.DataFrame:
     """
@@ -341,7 +366,8 @@ def build_signal(
 | Line endings | `__FACTOR_PARAM_FIELDS__` / `__FACTOR_INIT__` / `__FACTOR_LOG__` / `__EXTRA_BUF_FIELDS__` / `__EXTRA_BUF_ENQUEUE__` / `__EXTRA_BUF_DEQUEUE__` / `__EXTRA_BUF_TOARRAY__` — every line ends with `\n` |
 | When no extra columns | `__EXTRA_BUF_FIELDS__` / `__EXTRA_BUF_ENQUEUE__` / `__EXTRA_BUF_DEQUEUE__` / `__EXTRA_BUF_TOARRAY__` are empty strings `""` |
 | Extra-column array length | Extra-column buffers use the same `requiredBars` window size as close |
-| **decimal → double cast** | `Open`/`High`/`Low`/`Close`/`Volume` are `decimal`; at Enqueue you must write `(double)bar.Volume` or you get `CS1503`. `TakerBuy*/TakerSell*/QuoteVolume` are already `double` — no cast needed |
+| **decimal → double cast** | `Open`/`High`/`Low`/`Close`/`Volume` are `decimal`; at Enqueue you must write `(double)bar.Volume` or you get `CS1503`. `TakerBuy*/TakerSell*/QuoteVolume` and all futures/on-chain columns (`OpenInterest*` / `FundingRate*` / `GlobalAccount*` / `TopPosition*` / `TopAccount*` / `Liquidation*` / `BinancePremiumIndex*`) are already `double` — no cast needed |
+| **NaN handling for futures/on-chain columns** | Auto-injected by the strategy template: a NaN scan over every array declared in `__EXTRA_BUF_TOARRAY__` is prepended to `Compute()` and returns `false` if any cell is NaN. You do NOT need a manual `if (double.IsNaN(x)) return false;` in your compute body — write your factor logic assuming all values are finite |
 
 #### Reference Implementations (full runnable examples)
 
@@ -538,6 +564,77 @@ def build_signal(
     total = taker_buy_volume + taker_sell_volume
     buy_ratio = taker_buy_volume / total.replace(0, float("nan"))
     signal = buy_ratio.rolling(window).mean() - 0.5
+    return signal.reindex_like(close)
+```
+
+</details>
+
+<details>
+<summary>Example: Funding Rate Reversion Factor (funding_rate_reversion) — uses futures column</summary>
+
+```python
+import pandas as pd
+import numpy as np
+from typing import Any, Dict
+
+FACTOR_TYPE = "funding_rate_reversion"
+
+FACTOR_DEFAULT_PARAMS = {
+    "window": 7,
+}
+
+FACTOR_SECTIONS = {
+    "__FACTOR_DESCRIPTION__": "Rolling-mean funding rate reversion: high funding → crowded long → short next; low funding → crowded short → long next",
+    "__FACTOR_FORMULA__":     "signal = -rolling_mean(funding_rate_close, w)",
+    "__FACTOR_TYPE__":        "funding_rate_reversion",
+    "__FACTOR_PARAM_FIELDS__": (
+        "        private int _window;\n"
+    ),
+    "__FACTOR_INIT__": (
+        '            _window = GetIntParameter("window", 7);\n'
+    ),
+    "__FACTOR_LOG__": (
+        '            Log($"[INIT] window={_window}");\n'
+    ),
+    "__PRICE_WINDOW_EXPR__": "_window",
+    # ── Extra column: funding_rate_close (double, no cast needed) ──
+    "__EXTRA_BUF_FIELDS__": (
+        "        private readonly Queue<double> _frBuf = new Queue<double>();\n"
+    ),
+    "__EXTRA_BUF_ENQUEUE__": (
+        "            _frBuf.Enqueue(bar.FundingRateClose);\n"
+    ),
+    "__EXTRA_BUF_DEQUEUE__": (
+        "            if (_frBuf.Count > requiredBars) _frBuf.Dequeue();\n"
+    ),
+    "__EXTRA_BUF_TOARRAY__": (
+        "            var frs = _frBuf.ToArray();\n"
+    ),
+    # The strategy template auto-injects a NaN scan over frs[] before this body runs,
+    # so we can compute the mean assuming all values are finite.
+    "__FACTOR_COMPUTE_BODY__": """
+            var n = prices.Length;
+            if (n < _window) return false;
+
+            double sum = 0.0;
+            for (int i = 0; i < frs.Length; i++) sum += frs[i];
+            var mean = sum / frs.Length;
+            rawSignal = -mean;
+            return true;
+""",
+}
+
+
+def build_signal(
+    close:               pd.DataFrame,
+    params:              Dict[str, Any],
+    funding_rate_close:  pd.DataFrame,
+    **_kwargs,
+) -> pd.DataFrame:
+    window = int(params.get("window", 7))
+    # rolling.mean() auto-skips NaN cells (min_periods=window ensures we never
+    # output a value computed on a partially-NaN window).
+    signal = -funding_rate_close.rolling(window, min_periods=window).mean()
     return signal.reindex_like(close)
 ```
 
