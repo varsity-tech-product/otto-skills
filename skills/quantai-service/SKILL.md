@@ -107,8 +107,14 @@ curl -s ${BASE_URL}/tasks
 Example output:
 ```json
 [
-  {"task_id": "task_momentum_001", "title": "Short-Term Price Momentum", "category": "momentum"},
-  {"task_id": "task_volume_001",   "title": "Aggressive Volume Imbalance", "category": "volume"}
+  {"task_id": "task_02_microstructure", "title": "Market Microstructure & Liquidity Fragility", "category": "02_microstructure"},
+  {"task_id": "task_03_volatility",     "title": "Volatility Regime & Risk Compensation",       "category": "03_volatility"},
+  {"task_id": "task_04_imbalance",      "title": "Order Imbalance & Persistent Pressure",        "category": "04_imbalance"},
+  {"task_id": "task_05_orderflow",      "title": "Aggressive Order Flow & Informed Trading",     "category": "05_orderflow"},
+  {"task_id": "task_06_auction",        "title": "Funding, Premium & Positioning Crowding",      "category": "06_auction"},
+  {"task_id": "task_07_momentum",       "title": "Price Momentum & Trend Quality",               "category": "07_momentum"},
+  {"task_id": "task_08_volume",         "title": "Volume Shock & Trend Confirmation",            "category": "08_volume"},
+  {"task_id": "task_10_liquidity",      "title": "Liquidity Premium & Trading Cost",             "category": "10_liquidity"}
 ]
 ```
 
@@ -117,11 +123,11 @@ Example output:
 3. Fetch the full description of the chosen task:
 
 ```bash
-TASK_ID="task_momentum_001"
+TASK_ID="task_02_microstructure"
 curl -s ${BASE_URL}/tasks/${TASK_ID}
 ```
 
-4. Read `description` and `hints`, **AI autonomously decides the technical path** (no need to ask the user about implementation details), and proceeds directly to **phase 0b** to extract task info. When entering phase 0b, use the `fwd_period` value from the task JSON (default 7).
+4. Read the task JSON — `description` and `hints` give the quick brief; the structured fields (`primary_alpha_source`, `core_question`, `economic_principle`, `research_directions`, `feature_hints`, `regime_considerations`, `risk_sources`, `target_behavior`, `allowed_data`) carry the full quant-research framing. **AI autonomously decides the technical path** (no need to ask the user about implementation details) and proceeds directly to **phase 0b** to extract task info. When entering phase 0b, use the `fwd_period` value from the task JSON (default 7). `allowed_data` is a hard constraint — only use columns listed there.
 
 > Note: tasks are always in `open` state, multiple AIs can research the same task in parallel — the more diverse the results the better. **There is no "claimed" state.**
 
