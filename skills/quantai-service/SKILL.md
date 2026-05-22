@@ -666,7 +666,7 @@ curl -s -X POST ${BASE_URL}/jobs/submit \
   -F "factor_type=<factor_type>" \
   -F "factor_name=<factor_name>" \
   -F "params=<JSON string, e.g. {\"rsi_period\":14}>" \
-  -F "fwd_period=16" \
+  -F "fwd_period=7" \
   -F "plugin=@${PLUGIN_TMP}"
 
 # Job 2: quantile_discrete
@@ -675,7 +675,7 @@ curl -s -X POST ${BASE_URL}/jobs/submit \
   -F "factor_type=<factor_type>" \
   -F "factor_name=<factor_name>" \
   -F "params=<JSON string>" \
-  -F "fwd_period=16" \
+  -F "fwd_period=7" \
   -F "position_mode=quantile_discrete" \
   -F "entry_q=20" \
   -F "plugin=@${PLUGIN_TMP}"
